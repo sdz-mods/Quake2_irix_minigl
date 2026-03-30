@@ -51,9 +51,10 @@ void GL_SetTexturePalette( unsigned palette[256] )
 
 	for ( i = 0; i < 256; i++ )
 	{
-		temptable[i*3+0] = ( palette[i] >> 0 ) & 0xff;
-		temptable[i*3+1] = ( palette[i] >> 8 ) & 0xff;
-		temptable[i*3+2] = ( palette[i] >> 16 ) & 0xff;
+		const byte *rgba = (const byte *)&palette[i];
+		temptable[i*3+0] = rgba[0];
+		temptable[i*3+1] = rgba[1];
+		temptable[i*3+2] = rgba[2];
 	}
 
 	if ( qglColorTableEXT && gl_ext_palettedtexture->value )
@@ -1189,6 +1190,7 @@ qboolean GL_Upload8 (byte *data, int width, int height,  qboolean mipmap, qboole
 
 		qglTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, gl_filter_max);
 		qglTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, gl_filter_max);
+		return false;
 	}
 	else
 	{
@@ -1568,4 +1570,3 @@ void	GL_ShutdownImages (void)
 		memset (image, 0, sizeof(*image));
 	}
 }
-

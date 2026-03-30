@@ -1472,7 +1472,8 @@ void CL_AddEntities (void)
 #if 0
 	CL_AddProjectiles ();
 #endif
-	CL_AddTEnts ();
+	if (cl_add_tents->value)
+		CL_AddTEnts ();
 	CL_AddParticles ();
 	CL_AddDLights ();
 	CL_AddLightStyles ();

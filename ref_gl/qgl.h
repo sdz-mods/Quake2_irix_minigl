@@ -376,7 +376,7 @@ extern  void ( APIENTRY * qglViewport )(GLint x, GLint y, GLsizei width, GLsizei
 
 extern	void ( APIENTRY * qglPointParameterfEXT)( GLenum param, GLfloat value );
 extern	void ( APIENTRY * qglPointParameterfvEXT)( GLenum param, const GLfloat *value );
-extern	void ( APIENTRY * qglColorTableEXT)( int, int, int, int, int, const void * );
+extern	void ( APIENTRY * qglColorTableEXT)( GLenum target, GLenum internalformat, GLsizei width, GLenum format, GLenum type, const GLvoid *table );
 
 extern	void ( APIENTRY * qglLockArraysEXT) (int , int);
 extern	void ( APIENTRY * qglUnlockArraysEXT) (void);
@@ -425,18 +425,32 @@ extern BOOL ( WINAPI * qwglSetDeviceGammaRampEXT ) ( const unsigned char *pRed, 
 /*
 ** extension constants
 */
+#ifndef GL_POINT_SIZE_MIN_EXT
 #define GL_POINT_SIZE_MIN_EXT				0x8126
+#endif
+#ifndef GL_POINT_SIZE_MAX_EXT
 #define GL_POINT_SIZE_MAX_EXT				0x8127
+#endif
+#ifndef GL_POINT_FADE_THRESHOLD_SIZE_EXT
 #define GL_POINT_FADE_THRESHOLD_SIZE_EXT	0x8128
+#endif
+#ifndef GL_DISTANCE_ATTENUATION_EXT
 #define GL_DISTANCE_ATTENUATION_EXT			0x8129
+#endif
 
+#ifndef GL_SHARED_TEXTURE_PALETTE_EXT
 #ifdef __sgi
 #define GL_SHARED_TEXTURE_PALETTE_EXT		GL_TEXTURE_COLOR_TABLE_SGI
 #else
 #define GL_SHARED_TEXTURE_PALETTE_EXT		0x81FB
 #endif
+#endif
 
+#ifndef GL_TEXTURE0_SGIS
 #define GL_TEXTURE0_SGIS					0x835E
+#endif
+#ifndef GL_TEXTURE1_SGIS
 #define GL_TEXTURE1_SGIS					0x835F
+#endif
 
 #endif

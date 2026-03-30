@@ -148,7 +148,6 @@ void GL_DrawAliasFrameLerp (dmdl_t *paliashdr, float backlerp)
 	}
 
 	lerp = s_lerped[0];
-
 	GL_LerpVerts( paliashdr->num_xyz, v, ov, verts, lerp, move, frontv, backv );
 
 	if ( gl_vertex_arrays->value )
@@ -835,5 +834,3 @@ void R_DrawAliasModel (entity_t *e)
 #endif
 	qglColor4f (1,1,1,1);
 }
-
-

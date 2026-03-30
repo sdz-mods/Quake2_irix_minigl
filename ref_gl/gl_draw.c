@@ -23,9 +23,37 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include "gl_local.h"
 
 image_t		*draw_chars;
+static int	draw_scrap_prime_frame = -1;
 
 extern	qboolean	scrap_dirty;
 void Scrap_Upload (void);
+
+static void Draw_PrimeScrap(image_t *gl)
+{
+	if (!gl || !gl->scrap)
+		return;
+	if (!(gl_config.renderer & GL_RENDERER_VOODOO))
+		return;
+	if (draw_scrap_prime_frame == r_framecount)
+		return;
+
+	draw_scrap_prime_frame = r_framecount;
+
+	qglEnable(GL_SCISSOR_TEST);
+	qglScissor(0, 0, 0, 0);
+	GL_Bind(gl->texnum);
+	qglBegin(GL_QUADS);
+	qglTexCoord2f(gl->sl, gl->tl);
+	qglVertex2f(0, 0);
+	qglTexCoord2f(gl->sh, gl->tl);
+	qglVertex2f(1, 0);
+	qglTexCoord2f(gl->sh, gl->th);
+	qglVertex2f(1, 1);
+	qglTexCoord2f(gl->sl, gl->th);
+	qglVertex2f(0, 1);
+	qglEnd();
+	qglDisable(GL_SCISSOR_TEST);
+}
 
 
 /*
@@ -56,7 +84,9 @@ smoothly scrolled off.
 void Draw_Char (int x, int y, int num)
 {
 	int				row, col;
-	float			frow, fcol, size;
+	float			frow, fcol, size_u, size_v;
+	float			left_edge_u, right_edge_u, top_edge_v, bottom_edge_v;
+	float			s0, t0, s1, t1;
 
 	num &= 255;
 	
@@ -69,20 +99,31 @@ void Draw_Char (int x, int y, int num)
 	row = num>>4;
 	col = num&15;
 
-	frow = row*0.0625;
-	fcol = col*0.0625;
-	size = 0.0625;
+	size_u = 8.0f / (float)draw_chars->upload_width;
+	size_v = 8.0f / (float)draw_chars->upload_height;
+	frow = row * size_v;
+	fcol = col * size_u;
+	left_edge_u = 0.01f / (float)draw_chars->upload_width;
+	right_edge_u = 0.01f / (float)draw_chars->upload_width;
+	top_edge_v = 0.01f / (float)draw_chars->upload_height;
+	bottom_edge_v = 0.25f / (float)draw_chars->upload_height;
+
+	/* SST-1 still bleeds from the bottom edge of 8x8 glyph cells unless it is pulled in. */
+	s0 = fcol + left_edge_u;
+	t0 = frow + top_edge_v;
+	s1 = (fcol + size_u) - right_edge_u;
+	t1 = (frow + size_v) - bottom_edge_v;
 
 	GL_Bind (draw_chars->texnum);
 
 	qglBegin (GL_QUADS);
-	qglTexCoord2f (fcol, frow);
+	qglTexCoord2f (s0, t0);
 	qglVertex2f (x, y);
-	qglTexCoord2f (fcol + size, frow);
+	qglTexCoord2f (s1, t0);
 	qglVertex2f (x+8, y);
-	qglTexCoord2f (fcol + size, frow + size);
+	qglTexCoord2f (s1, t1);
 	qglVertex2f (x+8, y+8);
-	qglTexCoord2f (fcol, frow + size);
+	qglTexCoord2f (s0, t1);
 	qglVertex2f (x, y+8);
 	qglEnd ();
 }
@@ -149,6 +190,7 @@ void Draw_StretchPic (int x, int y, int w, int h, char *pic)
 	if ( ( ( gl_config.renderer == GL_RENDERER_MCD ) || ( gl_config.renderer & GL_RENDERER_RENDITION ) ) && !gl->has_alpha)
 		qglDisable (GL_ALPHA_TEST);
 
+	Draw_PrimeScrap(gl);
 	GL_Bind (gl->texnum);
 	qglBegin (GL_QUADS);
 	qglTexCoord2f (gl->sl, gl->tl);
@@ -187,6 +229,7 @@ void Draw_Pic (int x, int y, char *pic)
 	if ( ( ( gl_config.renderer == GL_RENDERER_MCD ) || ( gl_config.renderer & GL_RENDERER_RENDITION ) ) && !gl->has_alpha)
 		qglDisable (GL_ALPHA_TEST);
 
+	Draw_PrimeScrap(gl);
 	GL_Bind (gl->texnum);
 	qglBegin (GL_QUADS);
 	qglTexCoord2f (gl->sl, gl->tl);
@@ -341,7 +384,7 @@ void Draw_StretchRaw (int x, int y, int w, int h, int cols, int rows, byte *data
 	}
 	t = rows*hscale / 256;
 
-	if ( !qglColorTableEXT )
+	if ( !qglColorTableEXT || !gl_ext_palettedtexture->value )
 	{
 		unsigned *dest;
 
@@ -412,4 +455,3 @@ void Draw_StretchRaw (int x, int y, int w, int h, int cols, int rows, byte *data
 	if ( ( gl_config.renderer == GL_RENDERER_MCD ) || ( gl_config.renderer & GL_RENDERER_RENDITION ) ) 
 		qglEnable (GL_ALPHA_TEST);
 }
-

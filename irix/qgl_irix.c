@@ -12,6 +12,8 @@
 #include "../ref_gl/gl_local.h"
 
 static FILE *log_fp = NULL;
+extern void APIENTRY glColorTableEXT(GLenum target, GLenum internalformat, GLsizei width,
+	GLenum format, GLenum type, const GLvoid *table);
 
 void ( APIENTRY * qglAccum )(GLenum op, GLfloat value);
 void ( APIENTRY * qglAlphaFunc )(GLenum func, GLclampf ref);
@@ -350,9 +352,11 @@ void ( APIENTRY * qglVertex4sv )(const GLshort *v);
 void ( APIENTRY * qglVertexPointer )(GLint size, GLenum type, GLsizei stride, const GLvoid *pointer);
 void ( APIENTRY * qglViewport )(GLint x, GLint y, GLsizei width, GLsizei height);
 
+void ( APIENTRY * qglLockArraysEXT)( int, int);
+void ( APIENTRY * qglUnlockArraysEXT) ( void );
 void ( APIENTRY * qglPointParameterfEXT)( GLenum param, GLfloat value );
 void ( APIENTRY * qglPointParameterfvEXT)( GLenum param, const GLfloat *value );
-void ( APIENTRY * qglColorTableEXT)( int, int, int, int, int, const void * );
+void ( APIENTRY * qglColorTableEXT)( GLenum target, GLenum internalformat, GLsizei width, GLenum format, GLenum type, const GLvoid *table );
 void ( APIENTRY * qglSelectTextureSGIS)( GLenum );
 void ( APIENTRY * qglMTexCoord2fSGIS)( GLenum, GLfloat, GLfloat );
 
@@ -2924,6 +2928,8 @@ void QGL_Shutdown( void )
 	qglVertexPointer             = NULL;
 	qglViewport                  = NULL;
 
+	qglLockArraysEXT             = NULL;
+	qglUnlockArraysEXT           = NULL;
 	qglColorTableEXT             = NULL;
 
 }
@@ -2940,7 +2946,10 @@ void QGL_Shutdown( void )
 */
 qboolean QGL_Init( const char *dllname )
 {
+	(void)dllname;
+
 	gl_config.allow_cds = true;
+#if 0
 
 	qglAccum                     = dllAccum = glAccum;
 	qglAlphaFunc                 = dllAlphaFunc = glAlphaFunc;
@@ -3278,11 +3287,70 @@ qboolean QGL_Init( const char *dllname )
 	qglVertex4sv                 = 	dllVertex4sv                 = glVertex4sv;
 	qglVertexPointer             = 	dllVertexPointer             = glVertexPointer;
 	qglViewport                  = 	dllViewport                  = glViewport;
+#endif
+
+#define BIND(name) qgl##name = dll##name = gl##name
+	BIND(AlphaFunc);
+	BIND(ArrayElement);
+	BIND(Begin);
+	BIND(BindTexture);
+	BIND(BlendFunc);
+	BIND(Clear);
+	BIND(ClearColor);
+	BIND(Color3f);
+	BIND(Color3fv);
+	BIND(Color4f);
+	BIND(Color4fv);
+	BIND(Color4ubv);
+	BIND(ColorPointer);
+	BIND(CullFace);
+	BIND(DeleteTextures);
+	BIND(DepthFunc);
+	BIND(DepthMask);
+	BIND(DepthRange);
+	BIND(Disable);
+	BIND(DisableClientState);
+	BIND(DrawBuffer);
+	BIND(Enable);
+	BIND(EnableClientState);
+	BIND(End);
+	BIND(Finish);
+	BIND(Flush);
+	BIND(Frustum);
+	BIND(GetError);
+	BIND(GetFloatv);
+	BIND(GetString);
+	BIND(LoadIdentity);
+	BIND(LoadMatrixf);
+	BIND(MatrixMode);
+	BIND(Ortho);
+	BIND(PointSize);
+	BIND(PolygonMode);
+	BIND(PopMatrix);
+	BIND(PushMatrix);
+	BIND(ReadPixels);
+	BIND(Rotatef);
+	BIND(Scalef);
+	BIND(Scissor);
+	BIND(ShadeModel);
+	BIND(TexCoord2f);
+	BIND(TexEnvf);
+	BIND(TexImage2D);
+	BIND(TexParameterf);
+	BIND(TexSubImage2D);
+	BIND(Translatef);
+	BIND(Vertex2f);
+	BIND(Vertex3f);
+	BIND(Vertex3fv);
+	BIND(VertexPointer);
+	BIND(Viewport);
+#undef BIND
 
 	qglPointParameterfEXT = 0;
 	qglPointParameterfvEXT = 0;
-	qglColorTableEXT = glColorTableSGI;
-	qglColorTableEXT = 0;
+	qglLockArraysEXT = 0;
+	qglUnlockArraysEXT = 0;
+	qglColorTableEXT = glColorTableEXT;
 	qglSelectTextureSGIS = 0;
 	qglMTexCoord2fSGIS = 0;
 
@@ -3291,6 +3359,21 @@ qboolean QGL_Init( const char *dllname )
 
 void GLimp_EnableLogging( qboolean enable )
 {
+	static qboolean warned = false;
+
+	if ( log_fp )
+	{
+		fclose( log_fp );
+		log_fp = NULL;
+	}
+
+	if ( enable && !warned )
+	{
+		ri.Con_Printf( PRINT_ALL, "miniGL: gl_log is not supported on the direct Glide path\n" );
+		warned = true;
+	}
+
+#if 0
 	if ( enable )
 	{
 		if ( !log_fp )
@@ -3986,12 +4069,14 @@ void GLimp_EnableLogging( qboolean enable )
 		qglVertexPointer             = 	dllVertexPointer             ;
 		qglViewport                  = 	dllViewport                  ;
 	}
+#endif
 }
 
 
 void GLimp_LogNewFrame( void )
 {
+	if ( !log_fp )
+		return;
+
 	fprintf( log_fp, "*** R_BeginFrame ***\n");
 }
-
-

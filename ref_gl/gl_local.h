@@ -183,10 +183,21 @@ extern	cvar_t	*r_fullbright;
 extern	cvar_t	*r_novis;
 extern	cvar_t	*r_nocull;
 extern	cvar_t	*r_lerpmodels;
+extern	cvar_t	*r_drawaliasmodels;
+extern	cvar_t	*r_drawspritemodels;
+extern	cvar_t	*r_drawbrushmodels;
+extern	cvar_t	*r_drawbeams;
+extern	cvar_t	*r_drawalphasurfaces;
+extern	cvar_t	*r_drawwarpsurfaces;
+extern	cvar_t	*r_drawsky;
+extern	cvar_t	*r_drawflowingsurfaces;
+extern	cvar_t	*r_drawworldtextures;
+extern	cvar_t	*r_drawlightmapblends;
 
 extern	cvar_t	*r_lightlevel;	// FIXME: This is a HACK to get the client's light level
 
 extern cvar_t	*gl_vertex_arrays;
+extern cvar_t	*gl_v1_log_uploads;
 
 extern cvar_t	*gl_ext_swapinterval;
 extern cvar_t	*gl_ext_palettedtexture;
@@ -457,4 +468,3 @@ int     	GLimp_SetMode( int *pwidth, int *pheight, int mode, qboolean fullscreen
 void		GLimp_AppActivate( qboolean active );
 void		GLimp_EnableLogging( qboolean enable );
 void		GLimp_LogNewFrame( void );
-

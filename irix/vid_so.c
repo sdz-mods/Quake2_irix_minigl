@@ -31,7 +31,7 @@ cvar_t		*vid_fullscreen;
 // Global variables used internally by this module
 viddef_t	viddef;				// global video state; used by other modules
 void		*reflib_library;		// Handle to refresh DLL 
-qboolean	reflib_active = 0;
+qboolean	reflib_active = false;
 
 #define VID_NUM_MODES ( sizeof( vid_modes ) / sizeof( vid_modes[0] ) )
 
@@ -286,7 +286,7 @@ qboolean VID_LoadRefresh( char *name )
 	    void RW_IN_Commands (void);
 	    void RW_IN_Move (usercmd_t *cmd);
 	    void RW_IN_Frame (void);
-	    void RW_IN_Activate(void);
+	    void RW_IN_Activate(qboolean active);
 
 	    RW_IN_Init_fp = RW_IN_Init;
 	    RW_IN_Shutdown_fp = RW_IN_Shutdown;
@@ -316,7 +316,7 @@ qboolean VID_LoadRefresh( char *name )
 		Sys_Error("No KBD functions in REF.\n");
 #else
 	{
-		void KBD_Init(void);
+		void KBD_Init(Key_Event_fp_t fp);
 		void KBD_Update(void);
 		void KBD_Close(void);
 
@@ -489,4 +489,3 @@ void Do_Key_Event(int key, qboolean down)
 {
 	Key_Event(key, down, Sys_Milliseconds());
 }
-

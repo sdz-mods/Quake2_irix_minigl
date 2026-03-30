@@ -1,927 +1,451 @@
-/*
-** GLW_IMP.C
-**
-** This file contains ALL Linux specific stuff having to do with the
-** OpenGL refresh.  When a port is being made the following functions
-** must be implemented by the port:
-**
-** GLimp_EndFrame
-** GLimp_Init
-** GLimp_Shutdown
-** GLimp_SwitchFullscreen
-**
-*/
-
+#include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
-
-#include <X11/Xlib.h>
-#include <X11/Xutil.h>
-#include <X11/Xatom.h>
-#include <X11/keysym.h>
-#include <X11/extensions/XShm.h>
-#include <Xm/MwmUtil.h>
-
-#include <GL/glx.h>
+#include <string.h>
+#include <termios.h>
+#include <unistd.h>
 
 #include "../ref_gl/gl_local.h"
 #include "../client/keys.h"
 #include "../linux/rw_linux.h"
 
-GLXContext				gl_cx;
+#include "minigl_irix.h"
 
-static qboolean			doShm;
-static Display			*x_disp;
-static Colormap			x_cmap;
-static Window			x_win;
-static GC				x_gc;
-static Visual			*x_vis;
-static XVisualInfo		*x_visinfo;
+extern cvar_t *vid_fullscreen;
 
-static int				StudlyRGBattributes[] =
-{
-    GLX_DOUBLEBUFFER,
-    GLX_RGBA,
-    GLX_RED_SIZE, 4,
-    GLX_GREEN_SIZE, 4,
-    GLX_BLUE_SIZE, 4,
-    GLX_DEPTH_SIZE, 1,
-    GLX_SAMPLES_SGIS, 4, /* for better AA */
-    None,
+typedef struct {
+	int width;
+	int height;
+	GrScreenResolution_t resolution;
+} glide_mode_t;
+
+static const glide_mode_t glide_modes[] = {
+	{ 320, 240, GR_RESOLUTION_320x240 },
+	{ 400, 300, GR_RESOLUTION_400x300 },
+	{ 512, 384, GR_RESOLUTION_512x384 },
+	{ 640, 400, GR_RESOLUTION_640x400 },
+	{ 640, 480, GR_RESOLUTION_640x480 },
+	{ 800, 600, GR_RESOLUTION_800x600 },
+	{ 960, 720, GR_RESOLUTION_960x720 },
+	{ 1024, 768, GR_RESOLUTION_1024x768 },
+	{ 1280, 1024, GR_RESOLUTION_1280x1024 },
+	{ 1600, 1200, GR_RESOLUTION_1600x1200 }
 };
 
-static int				RGBattributes[] =
-{
-    GLX_DOUBLEBUFFER,
-    GLX_RGBA,
-    GLX_RED_SIZE, 4,
-    GLX_GREEN_SIZE, 4,
-    GLX_BLUE_SIZE, 4,
-    GLX_DEPTH_SIZE, 1,
-    None,
-};
+static in_state_t *glw_in_state;
+static Key_Event_fp_t glw_key_event_fp;
+static int glw_stdin_fd = 0;
+static int glw_stdin_flags = -1;
+static qboolean glw_terminal_active;
+static qboolean glw_terminal_available;
+static struct termios glw_terminal_mode;
+static unsigned char glw_input_buffer[64];
+static int glw_input_length;
+static unsigned glw_escape_time;
 
-#define STD_EVENT_MASK (StructureNotifyMask | KeyPressMask \
-	     | KeyReleaseMask | ExposureMask | PointerMotionMask | \
-	     ButtonPressMask | ButtonReleaseMask)
+#ifndef O_NONBLOCK
+#define O_NONBLOCK FNDELAY
+#endif
 
-int current_framebuffer;
-static int				x_shmeventtype;
-//static XShmSegmentInfo	x_shminfo;
-
-static qboolean			oktodraw = false;
-static qboolean			X11_active = false;
-
-struct
-{
-	int key;
-	int down;
-} keyq[64];
-int keyq_head=0;
-int keyq_tail=0;
-
-static int		mx, my;
-static int p_mouse_x, p_mouse_y;
-static cvar_t	*_windowed_mouse;
-
-static cvar_t *sensitivity;
-static cvar_t *lookstrafe;
-static cvar_t *m_side;
-static cvar_t *m_yaw;
-static cvar_t *m_pitch;
-static cvar_t *m_forward;
-static cvar_t *freelook;
-
-int config_notify=0;
-int config_notify_width;
-int config_notify_height;
-						      
-typedef unsigned short PIXEL;
-
-// Console variables that we need to access from this module
-
-/*****************************************************************************/
-/* MOUSE                                                                     */
-/*****************************************************************************/
-
-// this is inside the renderer shared lib, so these are called from vid_so
-
-static qboolean        mouse_avail;
-static int     mouse_buttonstate;
-static int     mouse_oldbuttonstate;
-static int   mouse_x, mouse_y;
-static int	old_mouse_x, old_mouse_y;
-static float old_windowed_mouse;
-static int p_mouse_x, p_mouse_y;
-
-static cvar_t	*_windowed_mouse;
-static cvar_t	*m_filter;
-static cvar_t	*in_mouse;
-
-static qboolean	mlooking;
-
-// state struct passed in Init
-static in_state_t	*in_state;
-
-int XShmQueryExtension(Display *);
-int XShmGetEventBase(Display *);
+#define GLW_ESCAPE_TIMEOUT_MS 75u
 
 static void signal_handler(int sig)
 {
-	fprintf(stderr, "Received signal %d, exiting...\n", sig);
+	fprintf(stderr, "Received signal %d, shutting down miniGL.\n", sig);
 	GLimp_Shutdown();
 	_exit(0);
 }
 
 static void InitSig(void)
 {
-        struct sigaction sa;
+	struct sigaction sa;
+
 	sigaction(SIGINT, 0, &sa);
 	sa.sa_handler = signal_handler;
 	sigaction(SIGINT, &sa, 0);
 	sigaction(SIGTERM, &sa, 0);
 }
 
-/*
-** GLimp_SetMode
-*/
-int GLimp_SetMode( int *pwidth, int *pheight, int mode, qboolean fullscreen )
+static qboolean GLimp_FindResolution(int width, int height, GrScreenResolution_t *resolution)
 {
-	int width, height;
-	GLint attribs[32];
+	unsigned i;
 
-	fprintf(stderr, "GLimp_SetMode\n");
-
-	ri.Con_Printf( PRINT_ALL, "Initializing OpenGL display\n");
-
-	ri.Con_Printf (PRINT_ALL, "...setting mode %d:", mode );
-
-	if ( !ri.Vid_GetModeInfo( &width, &height, mode ) )
+	for (i = 0; i < (sizeof(glide_modes) / sizeof(glide_modes[0])); ++i)
 	{
-		ri.Con_Printf( PRINT_ALL, " invalid mode\n" );
+		if (glide_modes[i].width == width && glide_modes[i].height == height)
+		{
+			*resolution = glide_modes[i].resolution;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static void GLW_TerminalRestore(void)
+{
+	if (glw_terminal_active)
+	{
+		tcsetattr(glw_stdin_fd, TCSANOW, &glw_terminal_mode);
+		if (glw_stdin_flags != -1)
+			fcntl(glw_stdin_fd, F_SETFL, glw_stdin_flags);
+	}
+
+	glw_terminal_active = false;
+	glw_input_length = 0;
+	glw_escape_time = 0;
+}
+
+static qboolean GLW_TerminalInit(void)
+{
+	struct termios raw_mode;
+
+	glw_terminal_available = false;
+	glw_terminal_active = false;
+	glw_input_length = 0;
+	glw_escape_time = 0;
+
+	if (!isatty(glw_stdin_fd))
+		return false;
+
+	if (tcgetattr(glw_stdin_fd, &glw_terminal_mode) == -1)
+		return false;
+
+	raw_mode = glw_terminal_mode;
+	raw_mode.c_lflag &= ~(ICANON | ECHO);
+	raw_mode.c_iflag &= ~(ICRNL | IXON);
+	raw_mode.c_cc[VMIN] = 0;
+	raw_mode.c_cc[VTIME] = 0;
+
+	glw_stdin_flags = fcntl(glw_stdin_fd, F_GETFL, 0);
+	if (glw_stdin_flags == -1)
+		glw_stdin_flags = 0;
+
+	if (tcsetattr(glw_stdin_fd, TCSANOW, &raw_mode) == -1)
+		return false;
+
+	if (fcntl(glw_stdin_fd, F_SETFL, glw_stdin_flags | O_NONBLOCK) == -1)
+	{
+		tcsetattr(glw_stdin_fd, TCSANOW, &glw_terminal_mode);
+		return false;
+	}
+
+	glw_terminal_available = true;
+	glw_terminal_active = true;
+	return true;
+}
+
+static void GLW_SendKey(int key)
+{
+	if (!glw_key_event_fp || key <= 0 || key >= 256)
+		return;
+
+	glw_key_event_fp(key, true);
+	glw_key_event_fp(key, false);
+}
+
+static int GLW_MapAsciiKey(int ch)
+{
+	switch (ch)
+	{
+	case '\r':
+	case '\n':
+		return K_ENTER;
+	case '\t':
+		return K_TAB;
+	case 8:
+	case 127:
+		return K_BACKSPACE;
+	default:
+		if (ch >= 32 && ch <= 126)
+		{
+			if (isupper(ch))
+				ch = tolower(ch);
+			return ch;
+		}
+		break;
+	}
+
+	return 0;
+}
+
+static int GLW_ParseEscapeSequence(const unsigned char *buffer, int length, int *key, int *consumed)
+{
+	if (!buffer || length <= 0 || buffer[0] != 27)
+		return 0;
+
+	if (length == 1)
+		return -1;
+
+	if (length >= 3 && (buffer[1] == '[' || buffer[1] == 'O'))
+	{
+		switch (buffer[2])
+		{
+		case 'A': *key = K_UPARROW;    *consumed = 3; return 1;
+		case 'B': *key = K_DOWNARROW;  *consumed = 3; return 1;
+		case 'C': *key = K_RIGHTARROW; *consumed = 3; return 1;
+		case 'D': *key = K_LEFTARROW;  *consumed = 3; return 1;
+		case 'H': *key = K_HOME;       *consumed = 3; return 1;
+		case 'F': *key = K_END;        *consumed = 3; return 1;
+		default:
+			break;
+		}
+	}
+	else if (length == 2 && (buffer[1] == '[' || buffer[1] == 'O'))
+	{
+		return -1;
+	}
+
+	if (length >= 4 && buffer[1] == '[' && buffer[3] == '~')
+	{
+		switch (buffer[2])
+		{
+		case '1': *key = K_HOME; *consumed = 4; return 1;
+		case '2': *key = K_INS;  *consumed = 4; return 1;
+		case '3': *key = K_DEL;  *consumed = 4; return 1;
+		case '4': *key = K_END;  *consumed = 4; return 1;
+		case '5': *key = K_PGUP; *consumed = 4; return 1;
+		case '6': *key = K_PGDN; *consumed = 4; return 1;
+		default:
+			break;
+		}
+	}
+	else if (length == 3 && buffer[1] == '[' && buffer[2] >= '0' && buffer[2] <= '9')
+	{
+		return -1;
+	}
+
+	return 0;
+}
+
+static void GLW_ProcessInputBuffer(void)
+{
+	int offset = 0;
+
+	while (offset < glw_input_length)
+	{
+		int key = 0;
+		int consumed = 0;
+		int parse_result;
+
+		if (glw_input_buffer[offset] != 27)
+		{
+			key = GLW_MapAsciiKey(glw_input_buffer[offset]);
+			if (key)
+				GLW_SendKey(key);
+			offset++;
+			continue;
+		}
+
+		parse_result = GLW_ParseEscapeSequence(glw_input_buffer + offset, glw_input_length - offset, &key, &consumed);
+		if (parse_result > 0)
+		{
+			GLW_SendKey(key);
+			offset += consumed;
+			continue;
+		}
+
+		if (parse_result < 0 && ((unsigned)Sys_Milliseconds() - glw_escape_time) < GLW_ESCAPE_TIMEOUT_MS)
+			break;
+
+		GLW_SendKey(K_ESCAPE);
+		offset++;
+	}
+
+	if (offset > 0)
+	{
+		glw_input_length -= offset;
+		if (glw_input_length > 0)
+			memmove(glw_input_buffer, glw_input_buffer + offset, glw_input_length);
+	}
+
+	if (glw_input_length > 0 && glw_input_buffer[0] == 27 && glw_escape_time == 0)
+		glw_escape_time = (unsigned)Sys_Milliseconds();
+	else if (glw_input_length == 0)
+		glw_escape_time = 0;
+}
+
+int GLimp_SetMode(int *pwidth, int *pheight, int mode, qboolean fullscreen)
+{
+	int width;
+	int height;
+	GrScreenResolution_t resolution;
+
+	ri.Con_Printf(PRINT_ALL, "Initializing direct Glide display\n");
+	ri.Con_Printf(PRINT_ALL, "...setting mode %d:", mode);
+
+	if (!ri.Vid_GetModeInfo(&width, &height, mode))
+	{
+		ri.Con_Printf(PRINT_ALL, " invalid mode\n");
 		return rserr_invalid_mode;
 	}
 
-	ri.Con_Printf( PRINT_ALL, " %d %d\n", width, height );
+	if (!GLimp_FindResolution(width, height, &resolution))
+	{
+		ri.Con_Printf(PRINT_ALL, " %d %d not supported by the miniGL path\n", width, height);
+		return rserr_invalid_mode;
+	}
 
-	// destroy the existing window
-	GLimp_Shutdown ();
+	if (!fullscreen)
+		ri.Con_Printf(PRINT_ALL, "...miniGL/Glide is fullscreen-only; ignoring windowed request\n");
+
+	GLimp_Shutdown();
+
+	if (!MiniGL_SetMode(resolution, width, height))
+	{
+		ri.Con_Printf(PRINT_ALL, " Glide open failed for %d x %d\n", width, height);
+		return rserr_invalid_mode;
+	}
 
 	*pwidth = width;
 	*pheight = height;
+	ri.Vid_NewWindow(width, height);
 
-	if ( !GLimp_InitGraphics( fullscreen ) ) {
-		// failed to set a valid mode in windowed mode
-		return rserr_invalid_mode;
-	}
-/* 	gl_cx = glXCreateContext( x_disp, x_visinfo, 0, True ); */
-
-	// let the sound and input subsystems know about the new window
-	ri.Vid_NewWindow (width, height);
-
+	ri.Con_Printf(PRINT_ALL, " %d %d\n", width, height);
 	return rserr_ok;
 }
 
-/*
-** GLimp_Shutdown
-**
-** This routine does all OS specific shutdown procedures for the OpenGL
-** subsystem.  Under OpenGL this means NULLing out the current DC and
-** HGLRC, deleting the rendering context, and releasing the DC acquired
-** for the window.  The state structure is also nulled out.
-**
-*/
-void GLimp_Shutdown( void )
+void GLimp_Shutdown(void)
 {
-	fprintf(stderr, "GLimp_Shutdown\n");
-
-	if (!x_disp)
-	    return;
-
-	XSynchronize( x_disp, True );
-	XAutoRepeatOn(x_disp);
-	XCloseDisplay(x_disp);
-	x_disp = NULL;
+	GLW_TerminalRestore();
+	MiniGL_Shutdown();
 }
 
-/*
-** GLimp_Init
-**
-** This routine is responsible for initializing the OS specific portions
-** of OpenGL.  
-*/
-int GLimp_Init( void *hinstance, void *wndproc )
+int GLimp_Init(void *hinstance, void *wndproc)
 {
-// catch signals so i can turn on auto-repeat and stuff
+	(void)hinstance;
+	(void)wndproc;
+
 	InitSig();
-
 	return true;
 }
 
-/*
-** GLimp_BeginFrame
-*/
-void GLimp_BeginFrame( float camera_seperation )
+void GLimp_BeginFrame(float camera_separation)
+{
+	(void)camera_separation;
+}
+
+void GLimp_EndFrame(void)
+{
+	MiniGL_SwapBuffers();
+}
+
+void GLimp_AppActivate(qboolean active)
+{
+	(void)active;
+}
+
+static void RW_IN_ForceCenterView_f(void)
+{
+	if (glw_in_state)
+		glw_in_state->viewangles[PITCH] = 0;
+}
+
+static void RW_IN_MLookDown(void)
 {
 }
 
-/*
-** GLimp_EndFrame
-** 
-** Responsible for doing a swapbuffers and possibly for other stuff
-** as yet to be determined.  Probably better not to make this a GLimp
-** function and instead do a call to GLimp_SwapBuffers.
-*/
-void GLimp_EndFrame (void)
+static void RW_IN_MLookUp(void)
 {
-	glFlush();
-	glXSwapBuffers( x_disp, x_win );
+	if (glw_in_state)
+		glw_in_state->IN_CenterView_fp();
 }
-
-/*
-** GLimp_AppActivate
-*/
-void GLimp_AppActivate( qboolean active )
-{
-}
-
-// ========================================================================
-// makes a null cursor
-// ========================================================================
-
-static Cursor CreateNullCursor(Display *display, Window root)
-{
-    Pixmap cursormask; 
-    XGCValues xgc;
-    GC gc;
-    XColor dummycolour;
-    Cursor cursor;
-
-    cursormask = XCreatePixmap(display, root, 1, 1, 1/*depth*/);
-    xgc.function = GXclear;
-    gc =  XCreateGC(display, cursormask, GCFunction, &xgc);
-    XFillRectangle(display, cursormask, gc, 0, 0, 1, 1);
-    dummycolour.pixel = 0;
-    dummycolour.red = 0;
-    dummycolour.flags = 04;
-    cursor = XCreatePixmapCursor(display, cursormask, cursormask,
-          &dummycolour,&dummycolour, 0,0);
-    XFreePixmap(display,cursormask);
-    XFreeGC(display,gc);
-    return cursor;
-}
-
-/*
-** GLimp_InitGraphics
-**
-** This initializes the GL implementation specific
-** graphics subsystem.
-**
-** The necessary width and height parameters are grabbed from
-** vid.width and vid.height.
-*/
-qboolean GLimp_InitGraphics( qboolean fullscreen )
-{
-	int pnum, i;
-	XVisualInfo template;
-	int num_visuals;
-	int template_mask;
-
-	fprintf(stderr, "GLimp_InitGraphics\n");
-
-	srandom(getpid());
-
-	// let the sound and input subsystems know about the new window
-	ri.Vid_NewWindow (vid.width, vid.height);
-
-	// open the display
-	x_disp = XOpenDisplay(NULL);
-	if (!x_disp)
-	{
-		if (getenv("DISPLAY"))
-			Sys_Error("VID: Could not open display [%s]\n",
-				getenv("DISPLAY"));
-		else
-			Sys_Error("VID: Could not open local display\n");
-	}
-	else
-	    fprintf(stderr, "VID: Opened display %s\n", getenv("DISPLAY"));
-
-	XAutoRepeatOff(x_disp);
-
-// for debugging only
-	XSynchronize(x_disp, True);
-
-// check for command-line window size
-	template_mask = 0;
-
-#if 0
-// specify a visual id
-	if ((pnum=COM_CheckParm("-visualid")))
-	{
-		if (pnum >= com_argc-1)
-			Sys_Error("VID: -visualid <id#>\n");
-		template.visualid = Q_atoi(com_argv[pnum+1]);
-		template_mask = VisualIDMask;
-	}
-
-// If not specified, use default visual
-	else
-#endif
-	{
-		int screen;
-		screen = XDefaultScreen(x_disp);
-		template.visualid =
-			XVisualIDFromVisual(XDefaultVisual(x_disp, screen));
-		template_mask = VisualIDMask;
-	}
-
-// pick a visual- warn if more than one was available
-
-	x_visinfo = glXChooseVisual( x_disp, DefaultScreen( x_disp ),
-				     StudlyRGBattributes );
-	if (!x_visinfo)
-	{
-	    fprintf(stderr, "Using non studly RGB attributes\n");
-		x_visinfo = glXChooseVisual( x_disp, DefaultScreen( x_disp ),
-					     RGBattributes );
-		if (!x_visinfo) Sys_Error( "No matching visual available!\n" );
-	}
-
-	ri.Con_Printf(PRINT_ALL, "Using visualid 0x%x:\n",
-		   (int)(x_visinfo->visualid));
-#if 0
-	if (verbose)
-	{
-		printf("Using visualid %d:\n", (int)(x_visinfo->visualid));
-		printf("	screen %d\n", x_visinfo->screen);
-		printf("	red_mask 0x%x\n", (int)(x_visinfo->red_mask));
-		printf("	green_mask 0x%x\n", (int)(x_visinfo->green_mask));
-		printf("	blue_mask 0x%x\n", (int)(x_visinfo->blue_mask));
-		printf("	colormap_size %d\n", x_visinfo->colormap_size);
-		printf("	bits_per_rgb %d\n", x_visinfo->bits_per_rgb);
-	}
-#endif
-
-	x_vis = x_visinfo->visual;
-
-// setup attributes for main window
-	{
-	   int attribmask = CWEventMask  | CWColormap | CWBorderPixel;
-	   XSetWindowAttributes attribs;
-	   Colormap tmpcmap;
-	   
-	   Window root_win = XRootWindow(x_disp, x_visinfo->screen);
-
-	   tmpcmap = XCreateColormap(x_disp, root_win, x_vis, AllocNone);
-				     
-	   
-	   attribs.event_mask = STD_EVENT_MASK;
-	   attribs.border_pixel = 0;
-	   attribs.colormap = tmpcmap;
-
-// create the main window
-		x_win = XCreateWindow(	x_disp,
-			root_win,		
-			0, 0,	// x, y
-			vid.width, vid.height,
-			0, // borderwidth
-			x_visinfo->depth,
-			InputOutput,
-			x_vis,
-			attribmask,
-			&attribs );
-		XStoreName(x_disp, x_win, "Quake II");
-
-		if (x_visinfo->class != TrueColor)
-			XFreeColormap(x_disp, tmpcmap);
-	}
-
-	if (x_visinfo->depth == 8)
-	{
-	// create and upload the palette
-		if (x_visinfo->class == PseudoColor)
-		{
-			x_cmap = XCreateColormap(x_disp, x_win, x_vis, AllocAll);
-			XSetWindowColormap(x_disp, x_win, x_cmap);
-		}
-
-	}
-
-// inviso cursor
-	XDefineCursor(x_disp, x_win, CreateNullCursor(x_disp, x_win));
-
-// create the GC
-	{
-		XGCValues xgcvalues;
-		int valuemask = GCGraphicsExposures;
-		xgcvalues.graphics_exposures = False;
-		x_gc = XCreateGC(x_disp, x_win, valuemask, &xgcvalues );
-	}
-
-// set window properties for full screen
-	if (fullscreen) {
-	    MotifWmHints    wmhints;
-	    Atom aHints;
-	    XSizeHints              sizehints;
-	    XWindowChanges  changes;
-
-	    aHints = XInternAtom( x_disp, "_MOTIF_WM_HINTS", 0 );
-	    if (aHints == None)
-	    {
-                ri.Con_Printf( PRINT_ALL, "Could not intern X atom for _MOTIF_WM_HINTS." );
-/*                 return( false ); */
-	    }
-	    else {
-		wmhints.flags = MWM_HINTS_DECORATIONS;
-		wmhints.decorations = 0; // Absolutely no decorations.
-		XChangeProperty(x_disp, x_win, aHints, aHints, 32,
-				PropModeReplace, (unsigned char *)&wmhints,
-				4 );
-
-		sizehints.flags = USPosition | USSize;
-		sizehints.x = 0;
-		sizehints.y = 0;
-		sizehints.width = vid.width;
-		sizehints.height = vid.height;
-		XSetWMNormalHints( x_disp, x_win, &sizehints );
-
-		changes.x = 0;
-		changes.y = 0;
-		changes.width = vid.width;
-		changes.height = vid.height;
-		changes.stack_mode = TopIf;
-		XConfigureWindow(x_disp, x_win,
-				 CWX | CWY | CWWidth | CWHeight | CWStackMode,
-				 &changes);
-	    }
-	}
-
-// map the window
-	XMapWindow(x_disp, x_win);
-
-// wait for first exposure event
-	{
-		XEvent event;
-		do
-		{
-			XNextEvent(x_disp, &event);
-			if (event.type == Expose && !event.xexpose.count)
-				oktodraw = true;
-		} while (!oktodraw);
-	}
-// now safe to draw
-
-    gl_cx = glXCreateContext( x_disp, x_visinfo, 0, True );
-    if (!glXMakeCurrent( x_disp, x_win, gl_cx ))
-		Sys_Error( "Can't make window current to context\n" );
-
-// even if MITSHM is available, make sure it's a local connection
-#if 0
-// This is messing up the DISPLAY environment variable so can't close and
-// reopen the window (it lops off the :0.0)...
-	if (XShmQueryExtension(x_disp))
-	{
-		char *displayname;
-		doShm = true;
-		displayname = (char *) getenv("DISPLAY");
-		if (displayname)
-		{
-			char *d = displayname;
-			while (*d && (*d != ':')) d++;
-			if (*d) *d = 0;
-			if (!(!strcasecmp(displayname, "unix") || !*displayname))
-				doShm = false;
-		}
-	}
-#endif
-
-#if 0
-	if (doShm)
-	{
-		x_shmeventtype = XShmGetEventBase(x_disp) + ShmCompletion;
-		ResetSharedFrameBuffers();
-	}
-	else
-		ResetFrameBuffer();
-#endif
-
-	current_framebuffer = 0;
-/* 	vid.rowbytes = x_framebuffer[0]->bytes_per_line; */
-/* 	vid.buffer = x_framebuffer[0]->data; */
-
-//	XSynchronize(x_disp, False);
-
-	X11_active = true;
-
-	return true;
-}
-
-/*****************************************************************************/
-
-int XLateKey(XKeyEvent *ev)
-{
-
-	int key;
-	char buf[64];
-	KeySym keysym;
-
-	key = 0;
-
-	XLookupString(ev, buf, sizeof buf, &keysym, 0);
-
-	switch(keysym)
-	{
-		case XK_KP_Page_Up:	 key = K_KP_PGUP; break;
-		case XK_Page_Up:	 key = K_PGUP; break;
-
-		case XK_KP_Page_Down: key = K_KP_PGDN; break;
-		case XK_Page_Down:	 key = K_PGDN; break;
-
-		case XK_KP_Home: key = K_KP_HOME; break;
-		case XK_Home:	 key = K_HOME; break;
-
-		case XK_KP_End:  key = K_KP_END; break;
-		case XK_End:	 key = K_END; break;
-
-		case XK_KP_Left: key = K_KP_LEFTARROW; break;
-		case XK_Left:	 key = K_LEFTARROW; break;
-
-		case XK_KP_Right: key = K_KP_RIGHTARROW; break;
-		case XK_Right:	key = K_RIGHTARROW;		break;
-
-		case XK_KP_Down: key = K_KP_DOWNARROW; break;
-		case XK_Down:	 key = K_DOWNARROW; break;
-
-		case XK_KP_Up:   key = K_KP_UPARROW; break;
-		case XK_Up:		 key = K_UPARROW;	 break;
-
-		case XK_Escape: key = K_ESCAPE;		break;
-
-		case XK_KP_Enter: key = K_KP_ENTER;	break;
-		case XK_Return: key = K_ENTER;		 break;
-
-		case XK_Tab:		key = K_TAB;			 break;
-
-		case XK_F1:		 key = K_F1;				break;
-
-		case XK_F2:		 key = K_F2;				break;
-
-		case XK_F3:		 key = K_F3;				break;
-
-		case XK_F4:		 key = K_F4;				break;
-
-		case XK_F5:		 key = K_F5;				break;
-
-		case XK_F6:		 key = K_F6;				break;
-
-		case XK_F7:		 key = K_F7;				break;
-
-		case XK_F8:		 key = K_F8;				break;
-
-		case XK_F9:		 key = K_F9;				break;
-
-		case XK_F10:		key = K_F10;			 break;
-
-		case XK_F11:		key = K_F11;			 break;
-
-		case XK_F12:		key = K_F12;			 break;
-
-		case XK_BackSpace: key = K_BACKSPACE; break;
-
-		case XK_KP_Delete: key = K_KP_DEL; break;
-		case XK_Delete: key = K_DEL; break;
-
-		case XK_Pause:	key = K_PAUSE;		 break;
-
-		case XK_Shift_L:
-		case XK_Shift_R:	key = K_SHIFT;		break;
-
-		case XK_Execute: 
-		case XK_Control_L: 
-		case XK_Control_R:	key = K_CTRL;		 break;
-
-		case XK_Alt_L:	
-		case XK_Meta_L: 
-		case XK_Alt_R:	
-		case XK_Meta_R: key = K_ALT;			break;
-
-		case XK_KP_Begin: key = K_KP_5;	break;
-
-		case XK_Insert:key = K_INS; break;
-		case XK_KP_Insert: key = K_KP_INS; break;
-
-		case XK_KP_Multiply: key = '*'; break;
-		case XK_KP_Add:  key = K_KP_PLUS; break;
-		case XK_KP_Subtract: key = K_KP_MINUS; break;
-		case XK_KP_Divide: key = K_KP_SLASH; break;
-
-#if 0
-		case 0x021: key = '1';break;/* [!] */
-		case 0x040: key = '2';break;/* [@] */
-		case 0x023: key = '3';break;/* [#] */
-		case 0x024: key = '4';break;/* [$] */
-		case 0x025: key = '5';break;/* [%] */
-		case 0x05e: key = '6';break;/* [^] */
-		case 0x026: key = '7';break;/* [&] */
-		case 0x02a: key = '8';break;/* [*] */
-		case 0x028: key = '9';;break;/* [(] */
-		case 0x029: key = '0';break;/* [)] */
-		case 0x05f: key = '-';break;/* [_] */
-		case 0x02b: key = '=';break;/* [+] */
-		case 0x07c: key = '\'';break;/* [|] */
-		case 0x07d: key = '[';break;/* [}] */
-		case 0x07b: key = ']';break;/* [{] */
-		case 0x022: key = '\'';break;/* ["] */
-		case 0x03a: key = ';';break;/* [:] */
-		case 0x03f: key = '/';break;/* [?] */
-		case 0x03e: key = '.';break;/* [>] */
-		case 0x03c: key = ',';break;/* [<] */
-#endif
-
-		default:
-			key = *(unsigned char*)buf;
-			if (key >= 'A' && key <= 'Z')
-				key = key - 'A' + 'a';
-			break;
-	} 
-
-	return key;
-}
-
-void GetEvent(void)
-{
-	XEvent x_event;
-	int b;
-   
-	XNextEvent(x_disp, &x_event);
-	switch(x_event.type) {
-	case KeyPress:
-		keyq[keyq_head].key = XLateKey(&x_event.xkey);
-		keyq[keyq_head].down = true;
-		keyq_head = (keyq_head + 1) & 63;
-		break;
-	case KeyRelease:
-		keyq[keyq_head].key = XLateKey(&x_event.xkey);
-		keyq[keyq_head].down = false;
-		keyq_head = (keyq_head + 1) & 63;
-		break;
-
-	case MotionNotify:
-		if (_windowed_mouse->value) {
-			mx += ((int)x_event.xmotion.x - (int)(vid.width/2));
-			my += ((int)x_event.xmotion.y - (int)(vid.height/2));
-
-			/* move the mouse to the window center again */
-			XSelectInput(x_disp,x_win, STD_EVENT_MASK & ~PointerMotionMask);
-			XWarpPointer(x_disp,None,x_win,0,0,0,0, 
-				(vid.width/2),(vid.height/2));
-			XSelectInput(x_disp,x_win, STD_EVENT_MASK);
-		} else {
-			mx = ((int)x_event.xmotion.x - (int)p_mouse_x);
-			my = ((int)x_event.xmotion.y - (int)p_mouse_y);
-			p_mouse_x=x_event.xmotion.x;
-			p_mouse_y=x_event.xmotion.y;
-		}
-		break;
-
-	case ButtonPress:
-		b=-1;
-		if (x_event.xbutton.button == 1)
-			b = 0;
-		else if (x_event.xbutton.button == 2)
-			b = 2;
-		else if (x_event.xbutton.button == 3)
-			b = 1;
-		if (b>=0)
-			mouse_buttonstate |= 1<<b;
-		break;
-
-	case ButtonRelease:
-		b=-1;
-		if (x_event.xbutton.button == 1)
-			b = 0;
-		else if (x_event.xbutton.button == 2)
-			b = 2;
-		else if (x_event.xbutton.button == 3)
-			b = 1;
-		if (b>=0)
-			mouse_buttonstate &= ~(1<<b);
-		break;
-	
-	case ConfigureNotify:
-		config_notify_width = x_event.xconfigure.width;
-		config_notify_height = x_event.xconfigure.height;
-		config_notify = 1;
-		break;
-
-	default:
-		if (doShm && x_event.type == x_shmeventtype)
-			oktodraw = true;
-	}
-   
-	if (old_windowed_mouse != _windowed_mouse->value) {
-		old_windowed_mouse = _windowed_mouse->value;
-
-		if (!_windowed_mouse->value) {
-			/* ungrab the pointer */
-			XUngrabPointer(x_disp,CurrentTime);
-		} else {
-			/* grab the pointer */
-			XGrabPointer(x_disp,x_win,True,0,GrabModeAsync,
-				GrabModeAsync,x_win,None,CurrentTime);
-		}
-	}
-}
-
-/*****************************************************************************/
-
-/*****************************************************************************/
-/* KEYBOARD                                                                  */
-/*****************************************************************************/
-
-Key_Event_fp_t Key_Event_fp;
 
 void KBD_Init(Key_Event_fp_t fp)
 {
-	_windowed_mouse = ri.Cvar_Get ("_windowed_mouse", "0", CVAR_ARCHIVE);
-	Key_Event_fp = fp;
+	glw_key_event_fp = fp;
+	GLW_TerminalInit();
 }
 
 void KBD_Update(void)
 {
-// get events from x server
-	if (x_disp)
+	unsigned char read_buffer[32];
+	int bytes_read;
+
+	if (!glw_terminal_active)
+		return;
+
+	for (;;)
 	{
-		while (XPending(x_disp)) 
-			GetEvent();
-		while (keyq_head != keyq_tail)
+		bytes_read = read(glw_stdin_fd, read_buffer, sizeof(read_buffer));
+		if (bytes_read <= 0)
 		{
-			Key_Event_fp(keyq[keyq_tail].key, keyq[keyq_tail].down);
-			keyq_tail = (keyq_tail + 1) & 63;
+			if (bytes_read == 0 || errno == EAGAIN || errno == EWOULDBLOCK)
+				break;
+
+			GLW_TerminalRestore();
+			return;
 		}
+
+		if ((glw_input_length + bytes_read) > (int)sizeof(glw_input_buffer))
+		{
+			glw_input_length = 0;
+			glw_escape_time = 0;
+		}
+
+		memcpy(glw_input_buffer + glw_input_length, read_buffer, bytes_read);
+		if (glw_input_length == 0 && read_buffer[0] == 27)
+			glw_escape_time = (unsigned)Sys_Milliseconds();
+		glw_input_length += bytes_read;
 	}
+
+	GLW_ProcessInputBuffer();
 }
 
 void KBD_Close(void)
 {
-}
-
-
-static void Force_CenterView_f (void)
-{
-	in_state->viewangles[PITCH] = 0;
-}
-
-static void RW_IN_MLookDown (void) 
-{ 
-	mlooking = true; 
-}
-
-static void RW_IN_MLookUp (void) 
-{
-	mlooking = false;
-	in_state->IN_CenterView_fp ();
+	GLW_TerminalRestore();
+	glw_key_event_fp = NULL;
 }
 
 void RW_IN_Init(in_state_t *in_state_p)
 {
-	int mtype;
-	int i;
+	glw_in_state = in_state_p;
 
-	fprintf(stderr, "GL RW_IN_Init\n");
+	ri.Cvar_Get("_windowed_mouse", "0", CVAR_ARCHIVE);
+	ri.Cvar_Get("in_mouse", "0", CVAR_ARCHIVE);
+	ri.Cvar_Get("m_filter", "0", 0);
+	ri.Cvar_Get("freelook", "1", 0);
+	ri.Cvar_Get("lookstrafe", "0", 0);
+	ri.Cvar_Get("sensitivity", "3", 0);
+	ri.Cvar_Get("m_pitch", "0.022", 0);
+	ri.Cvar_Get("m_yaw", "0.022", 0);
+	ri.Cvar_Get("m_forward", "1", 0);
+	ri.Cvar_Get("m_side", "0.8", 0);
 
-	in_state = in_state_p;
+	ri.Cmd_AddCommand("+mlook", RW_IN_MLookDown);
+	ri.Cmd_AddCommand("-mlook", RW_IN_MLookUp);
+	ri.Cmd_AddCommand("force_centerview", RW_IN_ForceCenterView_f);
 
-	// mouse variables
-	_windowed_mouse = ri.Cvar_Get ("_windowed_mouse", "0", CVAR_ARCHIVE);
-	m_filter = ri.Cvar_Get ("m_filter", "0", 0);
-    in_mouse = ri.Cvar_Get ("in_mouse", "1", CVAR_ARCHIVE);
-	freelook = ri.Cvar_Get( "freelook", "0", 0 );
-	lookstrafe = ri.Cvar_Get ("lookstrafe", "0", 0);
-	sensitivity = ri.Cvar_Get ("sensitivity", "3", 0);
-	m_pitch = ri.Cvar_Get ("m_pitch", "0.022", 0);
-	m_yaw = ri.Cvar_Get ("m_yaw", "0.022", 0);
-	m_forward = ri.Cvar_Get ("m_forward", "1", 0);
-	m_side = ri.Cvar_Get ("m_side", "0.8", 0);
-
-	ri.Cmd_AddCommand ("+mlook", RW_IN_MLookDown);
-	ri.Cmd_AddCommand ("-mlook", RW_IN_MLookUp);
-
-	ri.Cmd_AddCommand ("force_centerview", Force_CenterView_f);
-
-	mouse_x = mouse_y = 0.0;
-	mouse_avail = true;
+	if (glw_terminal_available)
+		ri.Con_Printf(PRINT_ALL, "miniGL input: terminal keyboard mode active on stdin (Esc, `, arrows, Enter, Backspace, text).\n");
+	else
+		ri.Con_Printf(PRINT_ALL, "miniGL input note: stdin is not a terminal; keyboard emulation is unavailable.\n");
 }
 
 void RW_IN_Shutdown(void)
 {
-	mouse_avail = false;
-
-	ri.Cmd_RemoveCommand ("force_centerview");
-	ri.Cmd_RemoveCommand ("+mlook");
-	ri.Cmd_RemoveCommand ("-mlook");
+	ri.Cmd_RemoveCommand("+mlook");
+	ri.Cmd_RemoveCommand("-mlook");
+	ri.Cmd_RemoveCommand("force_centerview");
+	glw_in_state = NULL;
 }
 
-/*
-===========
-IN_Commands
-===========
-*/
-void RW_IN_Commands (void)
-{
-	int i;
-   
-	if (!mouse_avail) 
-		return;
-   
-	for (i=0 ; i<3 ; i++) {
-		if ( (mouse_buttonstate & (1<<i)) && !(mouse_oldbuttonstate & (1<<i)) )
-			in_state->Key_Event_fp (K_MOUSE1 + i, true);
-
-		if ( !(mouse_buttonstate & (1<<i)) && (mouse_oldbuttonstate & (1<<i)) )
-			in_state->Key_Event_fp (K_MOUSE1 + i, false);
-	}
-	mouse_oldbuttonstate = mouse_buttonstate;
-}
-
-/*
-===========
-IN_Move
-===========
-*/
-void RW_IN_Move (usercmd_t *cmd)
-{
-	if (!mouse_avail)
-		return;
-   
-	if (m_filter->value)
-	{
-		mouse_x = (mx + old_mouse_x) * 0.5;
-		mouse_y = (my + old_mouse_y) * 0.5;
-	} else {
-		mouse_x = mx;
-		mouse_y = my;
-	}
-
-	old_mouse_x = mx;
-	old_mouse_y = my;
-
-	if (!mouse_x && !mouse_y)
-		return;
-
-	mouse_x *= sensitivity->value;
-	mouse_y *= sensitivity->value;
-
-// add mouse X/Y movement to cmd
-	if ( (*in_state->in_strafe_state & 1) || 
-		(lookstrafe->value && mlooking ))
-		cmd->sidemove += m_side->value * mouse_x;
-	else
-		in_state->viewangles[YAW] -= m_yaw->value * mouse_x;
-
-	if ( (mlooking || freelook->value) && 
-		!(*in_state->in_strafe_state & 1))
-	{
-		in_state->viewangles[PITCH] += m_pitch->value * mouse_y;
-	}
-	else
-	{
-		cmd->forwardmove -= m_forward->value * mouse_y;
-	}
-	mx = my = 0;
-}
-
-void RW_IN_Frame (void)
+void RW_IN_Commands(void)
 {
 }
 
-void RW_IN_Activate(void)
+void RW_IN_Move(usercmd_t *cmd)
+{
+	(void)cmd;
+}
+
+void RW_IN_Frame(void)
 {
 }
 
-
-//===============================================================================
-
-/*
-================
-Sys_MakeCodeWriteable
-================
-*/
-void Sys_MakeCodeWriteable (unsigned long startaddr, unsigned long length)
+void RW_IN_Activate(qboolean active)
 {
-
-	int r;
-	unsigned long addr;
-	int psize = getpagesize();
-
-	addr = (startaddr & ~(psize-1)) - psize;
-
-//	fprintf(stderr, "writable code %lx(%lx)-%lx, length=%lx\n", startaddr,
-//			addr, startaddr+length, length);
-
-	r = mprotect((char*)addr, length + startaddr - addr + psize, 7);
-
-	if (r < 0)
-    		Sys_Error("Protection change failed\n");
-
+	(void)active;
 }

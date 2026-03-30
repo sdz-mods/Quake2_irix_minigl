@@ -61,6 +61,7 @@ static gllightmapstate_t gl_lms;
 static void		LM_InitBlock( void );
 static void		LM_UploadBlock( qboolean dynamic );
 static qboolean	LM_AllocBlock (int w, int h, int *x, int *y);
+void			R_RecursiveWorldNode (mnode_t *node);
 
 extern void R_SetCacheState( msurface_t *surf );
 extern void R_BuildLightMap (msurface_t *surf, byte *dest, int stride);
@@ -194,6 +195,19 @@ void DrawGLPoly (glpoly_t *p)
 
 //============
 //PGM
+static float R_FlowingTextureScroll( image_t *image )
+{
+	float	scroll;
+	float	width;
+
+	scroll = -64 * ( (r_newrefdef.time / 40.0) - (int)(r_newrefdef.time / 40.0) );
+	if (scroll == 0.0)
+		scroll = -64.0;
+
+	width = (image && image->width > 0) ? (float)image->width : 64.0f;
+	return scroll / width;
+}
+
 /*
 ================
 DrawGLFlowingPoly -- version of DrawGLPoly that handles scrolling texture
@@ -208,9 +222,7 @@ void DrawGLFlowingPoly (msurface_t *fa)
 
 	p = fa->polys;
 
-	scroll = -64 * ( (r_newrefdef.time / 40.0) - (int)(r_newrefdef.time / 40.0) );
-	if(scroll == 0.0)
-		scroll = -64.0;
+	scroll = R_FlowingTextureScroll( fa->texinfo->image );
 
 	qglBegin (GL_POLYGON);
 	v = p->verts[0];
@@ -486,6 +498,9 @@ void R_RenderBrushPoly (msurface_t *fa)
 
 	if (fa->flags & SURF_DRAWTURB)
 	{	
+		if (r_drawwarpsurfaces && !r_drawwarpsurfaces->value)
+			return;
+
 		GL_Bind( image->texnum );
 
 		// warp texture, no lightmaps
@@ -508,10 +523,18 @@ void R_RenderBrushPoly (msurface_t *fa)
 
 //======
 //PGM
-	if(fa->texinfo->flags & SURF_FLOWING)
-		DrawGLFlowingPoly (fa);
-	else
-		DrawGLPoly (fa->polys);
+	if (r_drawworldtextures && r_drawworldtextures->value)
+	{
+		if (fa->texinfo->flags & SURF_FLOWING)
+		{
+			if (r_drawflowingsurfaces && !r_drawflowingsurfaces->value)
+				DrawGLPoly (fa->polys);
+			else
+				DrawGLFlowingPoly (fa);
+		}
+		else
+			DrawGLPoly (fa->polys);
+	}
 //PGM
 //======
 
@@ -536,6 +559,9 @@ dynamic:
 			}
 		}
 	}
+
+	if (!(r_drawlightmapblends && r_drawlightmapblends->value))
+		return;
 
 	if ( is_dynamic )
 	{
@@ -574,6 +600,52 @@ dynamic:
 	}
 }
 
+static void R_DrawInlineAlphaSurface( msurface_t *s )
+{
+	float	intens;
+	image_t	*image;
+
+	if ( !s )
+		return;
+
+	if (r_drawalphasurfaces && !r_drawalphasurfaces->value)
+		return;
+
+	image = R_TextureAnimation( s->texinfo );
+	intens = gl_state.inverse_intensity;
+
+	qglEnable( GL_BLEND );
+	GL_TexEnv( GL_MODULATE );
+	GL_Bind( image->texnum );
+
+	if ( s->texinfo->flags & SURF_TRANS33 )
+		qglColor4f( intens, intens, intens, 0.33f );
+	else if ( s->texinfo->flags & SURF_TRANS66 )
+		qglColor4f( intens, intens, intens, 0.66f );
+	else
+		qglColor4f( intens, intens, intens, 1.0f );
+
+	if ( s->flags & SURF_DRAWTURB )
+	{
+		if ( !(r_drawwarpsurfaces && !r_drawwarpsurfaces->value) )
+			EmitWaterPolys( s );
+	}
+	else if ( s->texinfo->flags & SURF_FLOWING )
+	{
+		if (r_drawflowingsurfaces && !r_drawflowingsurfaces->value)
+			DrawGLPoly( s->polys );
+		else
+			DrawGLFlowingPoly( s );
+	}
+	else
+	{
+		DrawGLPoly( s->polys );
+	}
+
+	GL_TexEnv( GL_REPLACE );
+	qglColor4f( 1, 1, 1, 1 );
+	qglDisable( GL_BLEND );
+}
 
 /*
 ================
@@ -588,6 +660,12 @@ void R_DrawAlphaSurfaces (void)
 {
 	msurface_t	*s;
 	float		intens;
+
+	if (r_drawalphasurfaces && !r_drawalphasurfaces->value)
+	{
+		r_alpha_surfaces = NULL;
+		return;
+	}
 
 	//
 	// go back to the world matrix
@@ -612,7 +690,11 @@ void R_DrawAlphaSurfaces (void)
 		else
 			qglColor4f (intens,intens,intens,1);
 		if (s->flags & SURF_DRAWTURB)
+		{
+			if (r_drawwarpsurfaces && !r_drawwarpsurfaces->value)
+				continue;
 			EmitWaterPolys (s);
+		}
 		else
 			DrawGLPoly (s->polys);
 	}
@@ -694,6 +776,19 @@ void DrawTextureChains (void)
 	}
 
 	GL_TexEnv( GL_REPLACE );
+}
+
+static void ClearTextureChains( void )
+{
+	int		i;
+	image_t	*image;
+
+	for ( i = 0, image = gltextures; i < numgltextures; i++, image++ )
+	{
+		if (!image->registration_sequence)
+			continue;
+		image->texturechain = NULL;
+	}
 }
 
 
@@ -881,6 +976,7 @@ void R_DrawInlineBModel (void)
 	float		dot;
 	msurface_t	*psurf;
 	dlight_t	*lt;
+	image_t		*image;
 
 	// calculate dynamic lighting for bmodel
 	if ( !gl_flashblend->value )
@@ -916,9 +1012,8 @@ void R_DrawInlineBModel (void)
 			(!(psurf->flags & SURF_PLANEBACK) && (dot > BACKFACE_EPSILON)))
 		{
 			if (psurf->texinfo->flags & (SURF_TRANS33|SURF_TRANS66) )
-			{	// add to the translucent chain
-				psurf->texturechain = r_alpha_surfaces;
-				r_alpha_surfaces = psurf;
+			{
+				R_DrawInlineAlphaSurface( psurf );
 			}
 			else if ( qglMTexCoord2fSGIS && !( psurf->flags & SURF_DRAWTURB ) )
 			{
@@ -926,16 +1021,28 @@ void R_DrawInlineBModel (void)
 			}
 			else
 			{
-				GL_EnableMultitexture( false );
-				R_RenderBrushPoly( psurf );
-				GL_EnableMultitexture( true );
+				if ( !qglMTexCoord2fSGIS )
+				{
+					image = R_TextureAnimation( psurf->texinfo );
+					psurf->texturechain = image->texturechain;
+					image->texturechain = psurf;
+				}
+				else
+				{
+					GL_EnableMultitexture( false );
+					R_RenderBrushPoly( psurf );
+					GL_EnableMultitexture( true );
+				}
 			}
 		}
 	}
 
+	if ( !qglMTexCoord2fSGIS )
+		DrawTextureChains ();
+
 	if ( !(currententity->flags & RF_TRANSLUCENT) )
 	{
-		if ( !qglMTexCoord2fSGIS )
+		if ( !qglMTexCoord2fSGIS && r_drawlightmapblends && r_drawlightmapblends->value )
 			R_BlendLightmaps ();
 	}
 	else
@@ -956,6 +1063,7 @@ void R_DrawBrushModel (entity_t *e)
 	vec3_t		mins, maxs;
 	int			i;
 	qboolean	rotated;
+	qboolean	identity_transform;
 
 	if (currentmodel->nummodelsurfaces == 0)
 		return;
@@ -998,21 +1106,72 @@ void R_DrawBrushModel (entity_t *e)
 		modelorg[2] = DotProduct (temp, up);
 	}
 
-    qglPushMatrix ();
+	identity_transform =
+		(!rotated &&
+		(e->origin[0] == 0.0f) &&
+		(e->origin[1] == 0.0f) &&
+		(e->origin[2] == 0.0f));
+
+	if ( identity_transform && !( currententity->flags & RF_TRANSLUCENT ) )
+	{
+		if ( qglMTexCoord2fSGIS )
+		{
+			GL_EnableMultitexture( true );
+			GL_SelectTexture( GL_TEXTURE0_SGIS );
+			GL_TexEnv( GL_REPLACE );
+			GL_SelectTexture( GL_TEXTURE1_SGIS );
+			GL_TexEnv( GL_MODULATE );
+		}
+		else
+		{
+			GL_TexEnv( GL_REPLACE );
+		}
+
+		R_RecursiveWorldNode( currentmodel->nodes + currentmodel->firstnode );
+
+		if (r_drawworldtextures && r_drawworldtextures->value)
+			DrawTextureChains ();
+		else
+			ClearTextureChains();
+
+		if (r_drawlightmapblends && r_drawlightmapblends->value)
+			R_BlendLightmaps ();
+
+		if ( qglMTexCoord2fSGIS )
+			GL_EnableMultitexture( false );
+
+		return;
+	}
+
+	qglPushMatrix ();
 e->angles[0] = -e->angles[0];	// stupid quake bug
 e->angles[2] = -e->angles[2];	// stupid quake bug
 	R_RotateForEntity (e);
 e->angles[0] = -e->angles[0];	// stupid quake bug
 e->angles[2] = -e->angles[2];	// stupid quake bug
 
-	GL_EnableMultitexture( true );
-	GL_SelectTexture( GL_TEXTURE0_SGIS );
-	GL_TexEnv( GL_REPLACE );
-	GL_SelectTexture( GL_TEXTURE1_SGIS );
-	GL_TexEnv( GL_MODULATE );
+	if ( qglMTexCoord2fSGIS )
+	{
+		GL_EnableMultitexture( true );
+		GL_SelectTexture( GL_TEXTURE0_SGIS );
+		GL_TexEnv( GL_REPLACE );
+		GL_SelectTexture( GL_TEXTURE1_SGIS );
+		GL_TexEnv( GL_MODULATE );
+	}
+	else
+	{
+		GL_TexEnv( GL_REPLACE );
+	}
+
+	qglDisable( GL_CULL_FACE );
 
 	R_DrawInlineBModel ();
-	GL_EnableMultitexture( false );
+
+	if ( gl_cull->value )
+		qglEnable( GL_CULL_FACE );
+
+	if ( qglMTexCoord2fSGIS )
+		GL_EnableMultitexture( false );
 
 	qglPopMatrix ();
 }
@@ -1242,10 +1401,16 @@ void R_DrawWorld (void)
 	** theoretically nothing should happen in the next two functions
 	** if multitexture is enabled
 	*/
-	DrawTextureChains ();
-	R_BlendLightmaps ();
+	if (r_drawworldtextures && r_drawworldtextures->value)
+		DrawTextureChains ();
+	else
+		ClearTextureChains();
+
+	if (r_drawlightmapblends && r_drawlightmapblends->value)
+		R_BlendLightmaps ();
 	
-	R_DrawSkyBox ();
+	if (r_drawsky && r_drawsky->value)
+		R_DrawSkyBox ();
 
 	R_DrawTriangleOutlines ();
 }
@@ -1657,4 +1822,3 @@ void GL_EndBuildingLightmaps (void)
 	LM_UploadBlock( false );
 	GL_EnableMultitexture( false );
 }
-

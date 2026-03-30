@@ -76,6 +76,16 @@ cvar_t	*r_fullbright;
 cvar_t	*r_novis;
 cvar_t	*r_nocull;
 cvar_t	*r_lerpmodels;
+cvar_t	*r_drawaliasmodels;
+cvar_t	*r_drawspritemodels;
+cvar_t	*r_drawbrushmodels;
+cvar_t	*r_drawbeams;
+cvar_t	*r_drawalphasurfaces;
+cvar_t	*r_drawwarpsurfaces;
+cvar_t	*r_drawsky;
+cvar_t	*r_drawflowingsurfaces;
+cvar_t	*r_drawworldtextures;
+cvar_t	*r_drawlightmapblends;
 cvar_t	*r_lefthand;
 
 cvar_t	*r_lightlevel;	// FIXME: This is a HACK to get the client's light level
@@ -84,6 +94,7 @@ cvar_t	*gl_nosubimage;
 cvar_t	*gl_allow_software;
 
 cvar_t	*gl_vertex_arrays;
+cvar_t	*gl_v1_log_uploads;
 
 cvar_t	*gl_particle_min_size;
 cvar_t	*gl_particle_max_size;
@@ -178,6 +189,24 @@ R_DrawSpriteModel
 
 =================
 */
+static qboolean R_ShouldDrawEntityModel(const model_t *model)
+{
+	if (!model)
+		return true;
+
+	switch (model->type)
+	{
+	case mod_alias:
+		return (r_drawaliasmodels && r_drawaliasmodels->value);
+	case mod_brush:
+		return (r_drawbrushmodels && r_drawbrushmodels->value);
+	case mod_sprite:
+		return (r_drawspritemodels && r_drawspritemodels->value);
+	default:
+		return true;
+	}
+}
+
 void R_DrawSpriteModel (entity_t *e)
 {
 	float alpha = 1.0F;
@@ -329,7 +358,8 @@ void R_DrawEntitiesOnList (void)
 
 		if ( currententity->flags & RF_BEAM )
 		{
-			R_DrawBeam( currententity );
+			if (r_drawbeams && r_drawbeams->value)
+				R_DrawBeam( currententity );
 		}
 		else
 		{
@@ -339,6 +369,8 @@ void R_DrawEntitiesOnList (void)
 				R_DrawNullModel ();
 				continue;
 			}
+			if (!R_ShouldDrawEntityModel(currentmodel))
+				continue;
 			switch (currentmodel->type)
 			{
 			case mod_alias:
@@ -368,7 +400,8 @@ void R_DrawEntitiesOnList (void)
 
 		if ( currententity->flags & RF_BEAM )
 		{
-			R_DrawBeam( currententity );
+			if (r_drawbeams && r_drawbeams->value)
+				R_DrawBeam( currententity );
 		}
 		else
 		{
@@ -379,6 +412,8 @@ void R_DrawEntitiesOnList (void)
 				R_DrawNullModel ();
 				continue;
 			}
+			if (!R_ShouldDrawEntityModel(currentmodel))
+				continue;
 			switch (currentmodel->type)
 			{
 			case mod_alias:
@@ -509,15 +544,20 @@ R_PolyBlend
 */
 void R_PolyBlend (void)
 {
+	qboolean restore_cull;
+
 	if (!gl_polyblend->value)
 		return;
 	if (!v_blend[3])
 		return;
 
+	restore_cull = gl_cull->value ? true : false;
+
 	qglDisable (GL_ALPHA_TEST);
 	qglEnable (GL_BLEND);
 	qglDisable (GL_DEPTH_TEST);
 	qglDisable (GL_TEXTURE_2D);
+	qglDisable (GL_CULL_FACE);
 
     qglLoadIdentity ();
 
@@ -538,6 +578,9 @@ void R_PolyBlend (void)
 	qglDisable (GL_BLEND);
 	qglEnable (GL_TEXTURE_2D);
 	qglEnable (GL_ALPHA_TEST);
+
+	if (restore_cull)
+		qglEnable (GL_CULL_FACE);
 
 	qglColor4f(1,1,1,1);
 }
@@ -977,6 +1020,16 @@ void R_Register( void )
 	r_novis = ri.Cvar_Get ("r_novis", "0", 0);
 	r_nocull = ri.Cvar_Get ("r_nocull", "0", 0);
 	r_lerpmodels = ri.Cvar_Get ("r_lerpmodels", "1", 0);
+	r_drawaliasmodels = ri.Cvar_Get ("r_drawaliasmodels", "1", 0);
+	r_drawspritemodels = ri.Cvar_Get ("r_drawspritemodels", "1", 0);
+	r_drawbrushmodels = ri.Cvar_Get ("r_drawbrushmodels", "1", 0);
+	r_drawbeams = ri.Cvar_Get ("r_drawbeams", "1", 0);
+	r_drawalphasurfaces = ri.Cvar_Get ("r_drawalphasurfaces", "1", 0);
+	r_drawwarpsurfaces = ri.Cvar_Get ("r_drawwarpsurfaces", "1", 0);
+	r_drawsky = ri.Cvar_Get ("r_drawsky", "1", 0);
+	r_drawflowingsurfaces = ri.Cvar_Get ("r_drawflowingsurfaces", "1", 0);
+	r_drawworldtextures = ri.Cvar_Get ("r_drawworldtextures", "1", 0);
+	r_drawlightmapblends = ri.Cvar_Get ("r_drawlightmapblends", "1", 0);
 	r_speeds = ri.Cvar_Get ("r_speeds", "0", 0);
 
 	r_lightlevel = ri.Cvar_Get ("r_lightlevel", "0", 0);
@@ -1018,6 +1071,7 @@ void R_Register( void )
 	gl_lockpvs = ri.Cvar_Get( "gl_lockpvs", "0", 0 );
 
 	gl_vertex_arrays = ri.Cvar_Get( "gl_vertex_arrays", "0", CVAR_ARCHIVE );
+	gl_v1_log_uploads = ri.Cvar_Get( "gl_v1_log_uploads", "0", 0 );
 
 	gl_ext_swapinterval = ri.Cvar_Get( "gl_ext_swapinterval", "1", CVAR_ARCHIVE );
 	gl_ext_palettedtexture = ri.Cvar_Get( "gl_ext_palettedtexture", "1", CVAR_ARCHIVE );
@@ -1514,9 +1568,10 @@ void R_SetPalette ( const unsigned char *palette)
 	{
 		for ( i = 0; i < 256; i++ )
 		{
-			rp[i*4+0] = d_8to24table[i] & 0xff;
-			rp[i*4+1] = ( d_8to24table[i] >> 8 ) & 0xff;
-			rp[i*4+2] = ( d_8to24table[i] >> 16 ) & 0xff;
+			const byte *rgba = (const byte *)&d_8to24table[i];
+			rp[i*4+0] = rgba[0];
+			rp[i*4+1] = rgba[1];
+			rp[i*4+2] = rgba[2];
 			rp[i*4+3] = 0xff;
 		}
 	}
@@ -1568,6 +1623,7 @@ void R_DrawBeam( entity_t *e )
 	}
 
 	qglDisable( GL_TEXTURE_2D );
+	qglDisable( GL_CULL_FACE );
 	qglEnable( GL_BLEND );
 	qglDepthMask( GL_FALSE );
 
@@ -1581,17 +1637,19 @@ void R_DrawBeam( entity_t *e )
 
 	qglColor4f( r, g, b, e->alpha );
 
-	qglBegin( GL_TRIANGLE_STRIP );
+	qglBegin( GL_QUADS );
 	for ( i = 0; i < NUM_BEAM_SEGS; i++ )
 	{
 		qglVertex3fv( start_points[i] );
 		qglVertex3fv( end_points[i] );
-		qglVertex3fv( start_points[(i+1)%NUM_BEAM_SEGS] );
 		qglVertex3fv( end_points[(i+1)%NUM_BEAM_SEGS] );
+		qglVertex3fv( start_points[(i+1)%NUM_BEAM_SEGS] );
 	}
 	qglEnd();
 
 	qglEnable( GL_TEXTURE_2D );
+	if (gl_cull->value)
+		qglEnable( GL_CULL_FACE );
 	qglDisable( GL_BLEND );
 	qglDepthMask( GL_TRUE );
 }
