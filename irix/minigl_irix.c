@@ -177,6 +177,11 @@ typedef struct {
 	unsigned             texture_generation;
 	GLenum               current_error;
 	mgl_hw_state_t       hw;
+	/* Cached per-flush projection constants (computed once in mgl_flush_primitive) */
+	GLfloat              proj_view_top;
+	GLfloat              proj_screen_bias;
+	GLfloat              proj_tex_s_scale;
+	GLfloat              proj_tex_t_scale;
 } mgl_state_t;
 
 static mgl_state_t mgl;
@@ -452,7 +457,7 @@ static void mgl_set_error(GLenum error)
 
 static qboolean mgl_is_finite_float(GLfloat value)
 {
-	return (value == value) && ((GLfloat)fabs(value) <= FLT_MAX);
+	return (value == value) && (fabsf(value) <= FLT_MAX);
 }
 
 static void mgl_mat_identity(GLfloat *m)
@@ -491,10 +496,10 @@ static qboolean mgl_matrix_is_identity(const GLfloat *m)
 static qboolean mgl_is_ortho_2d_path(void)
 {
 	return mgl_matrix_is_identity(mgl.modelview) &&
-		((GLfloat)fabs(mgl.projection[3]) < 1.0e-6f) &&
-		((GLfloat)fabs(mgl.projection[7]) < 1.0e-6f) &&
-		((GLfloat)fabs(mgl.projection[11]) < 1.0e-6f) &&
-		((GLfloat)fabs(mgl.projection[15] - 1.0f) < 1.0e-6f);
+		(fabsf(mgl.projection[3]) < 1.0e-6f) &&
+		(fabsf(mgl.projection[7]) < 1.0e-6f) &&
+		(fabsf(mgl.projection[11]) < 1.0e-6f) &&
+		(fabsf(mgl.projection[15] - 1.0f) < 1.0e-6f);
 }
 
 static void mgl_mat_mul(GLfloat *dst, const GLfloat *a, const GLfloat *b)
@@ -1429,7 +1434,7 @@ static void mgl_apply_state(qboolean textured)
 
 	mgl_set_render_buffer((mgl.draw_buffer == GL_FRONT) ? GR_BUFFER_FRONTBUFFER : GR_BUFFER_BACKBUFFER);
 	mgl_apply_clip_window();
-	mgl_set_stw_hint(GR_STWHINT_W_DIFF_TMU0);
+	mgl_set_stw_hint(0);
 	mgl_set_cull_mode(GR_CULL_DISABLE);
 
 	if (mgl.depth_test_enabled)
@@ -1562,7 +1567,7 @@ static void mgl_draw_clear_quad(qboolean clear_color, qboolean clear_depth)
 	max_x = (GLfloat)mgl.video_width - 0.5f;
 	max_y = (GLfloat)mgl.video_height - 0.5f;
 
-	grHints(GR_HINT_STWHINT, GR_STWHINT_W_DIFF_TMU0);
+	mgl_set_stw_hint(0);
 	grCullMode(GR_CULL_DISABLE);
 	grAlphaBlendFunction(GR_BLEND_ONE, GR_BLEND_ZERO, GR_BLEND_ONE, GR_BLEND_ZERO);
 	grAlphaTestFunction(GR_CMP_ALWAYS);
@@ -1685,12 +1690,8 @@ static qboolean mgl_project_vertex(const mgl_vertex_t *src, GrVertex *dst, const
 	GLfloat ndc_y;
 	GLfloat ndc_z;
 	GLfloat depth;
-	GLfloat view_top;
-	GLfloat tex_s_scale = 1.0f;
-	GLfloat tex_t_scale = 1.0f;
-	GLfloat screen_bias;
 
-	if (fabs(src->clip[3]) < MGL_CLIP_EPSILON)
+	if (fabsf(src->clip[3]) < MGL_CLIP_EPSILON)
 		return false;
 
 	inv_w = 1.0f / src->clip[3];
@@ -1701,11 +1702,8 @@ static qboolean mgl_project_vertex(const mgl_vertex_t *src, GrVertex *dst, const
 		(((ndc_z + 1.0f) * 0.5f) * (mgl.depth_range_far - mgl.depth_range_near)));
 	depth = mgl_clampf(depth, 0.0f, 1.0f);
 
-	view_top = (GLfloat)(mgl.video_height - (mgl.viewport[1] + mgl.viewport[3]));
-	screen_bias = mgl_is_ortho_2d_path() ? 0.0f : 0.5f;
-
-	dst->x = mgl.viewport[0] + ((ndc_x + 1.0f) * 0.5f * mgl.viewport[2]) + screen_bias;
-	dst->y = view_top + ((1.0f - ndc_y) * 0.5f * mgl.viewport[3]) + screen_bias;
+	dst->x = mgl.viewport[0] + ((ndc_x + 1.0f) * 0.5f * mgl.viewport[2]) + mgl.proj_screen_bias;
+	dst->y = mgl.proj_view_top + ((1.0f - ndc_y) * 0.5f * mgl.viewport[3]) + mgl.proj_screen_bias;
 	dst->z = depth;
 	dst->ooz = (1.0f - depth) * 65535.0f;
 	dst->oow = inv_w;
@@ -1714,12 +1712,9 @@ static qboolean mgl_project_vertex(const mgl_vertex_t *src, GrVertex *dst, const
 	dst->b = mgl_clampf(src->color[2], 0.0f, 1.0f) * 255.0f;
 	dst->a = mgl_clampf(src->color[3], 0.0f, 1.0f) * 255.0f;
 
-	if (tex)
-		mgl_texture_coord_scales(tex->aspect, &tex_s_scale, &tex_t_scale);
-
 	dst->tmuvtx[0].oow = inv_w;
-	dst->tmuvtx[0].sow = src->tex[0] * tex_s_scale * inv_w;
-	dst->tmuvtx[0].tow = src->tex[1] * tex_t_scale * inv_w;
+	dst->tmuvtx[0].sow = src->tex[0] * mgl.proj_tex_s_scale * inv_w;
+	dst->tmuvtx[0].tow = src->tex[1] * mgl.proj_tex_t_scale * inv_w;
 
 	return true;
 }
@@ -2141,7 +2136,7 @@ static void mgl_draw_triangle_core(const mgl_vertex_t *a, const mgl_vertex_t *b,
 	}
 	else
 	{
-		guDrawTriangleWithClip(&ga, &gb, &gc);
+		grDrawTriangle(&ga, &gb, &gc);
 	}
 }
 
@@ -2357,7 +2352,7 @@ static void mgl_emit_line(const mgl_vertex_t *a, const mgl_vertex_t *b)
 		return;
 	if (!mgl_projected_vertex_is_safe(&ga, false) || !mgl_projected_vertex_is_safe(&gb, false))
 		return;
-	if ((GLfloat)fabs(ga.x - gb.x) < 0.25f && (GLfloat)fabs(ga.y - gb.y) < 0.25f)
+	if (fabsf(ga.x - gb.x) < 0.25f && fabsf(ga.y - gb.y) < 0.25f)
 		return;
 
 	grDrawLine(&ga, &gb);
@@ -2389,6 +2384,17 @@ static void mgl_flush_primitive(void)
 	tex = mgl_prepare_texture();
 	textured = (tex != NULL);
 	mgl_apply_state(textured);
+
+	/* Cache per-flush projection constants used by mgl_project_vertex() */
+	mgl.proj_view_top = (GLfloat)(mgl.video_height - (mgl.viewport[1] + mgl.viewport[3]));
+	mgl.proj_screen_bias = mgl_is_ortho_2d_path() ? 0.0f : 0.5f;
+	if (tex)
+		mgl_texture_coord_scales(tex->aspect, &mgl.proj_tex_s_scale, &mgl.proj_tex_t_scale);
+	else
+	{
+		mgl.proj_tex_s_scale = 1.0f;
+		mgl.proj_tex_t_scale = 1.0f;
+	}
 
 	switch (mgl.primitive_mode)
 	{
@@ -2552,7 +2558,7 @@ static void mgl_reset_state(void)
 
 	grRenderBuffer(GR_BUFFER_BACKBUFFER);
 	grSstOrigin(GR_ORIGIN_UPPER_LEFT);
-	grHints(GR_HINT_STWHINT, GR_STWHINT_W_DIFF_TMU0);
+	mgl_set_stw_hint(0);
 	grDepthBufferMode(GR_DEPTHBUFFER_DISABLE);
 	grDepthBufferFunction(GR_CMP_ALWAYS);
 	grDepthMask(FXTRUE);
