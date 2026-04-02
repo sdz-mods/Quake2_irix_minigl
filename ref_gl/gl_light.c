@@ -443,6 +443,7 @@ void R_SetCacheState( msurface_t *surf )
 	{
 		surf->cached_light[maps] = r_newrefdef.lightstyles[surf->styles[maps]].white;
 	}
+	surf->cached_dlight = (surf->dlightframe == r_framecount);
 }
 
 /*

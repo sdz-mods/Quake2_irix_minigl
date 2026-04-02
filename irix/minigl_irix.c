@@ -31,7 +31,8 @@
 typedef struct {
 	GLfloat clip[4];
 	GLfloat color[4];
-	GLfloat tex[2];
+	GLfloat tex[2];    /* TMU0 texture coordinates */
+	GLfloat tex2[2];   /* TMU1 texture coordinates (dual-TMU) */
 } mgl_vertex_t;
 
 typedef struct {
@@ -50,7 +51,12 @@ typedef struct {
 	size_t              data_size;
 	FxU32               resident_addr;
 	unsigned            resident_generation;
+	FxU32               resident_addr_tmu1;
+	unsigned            resident_generation_tmu1;
+	int                 dirty_t_min;   /* first dirty row (from glTexSubImage2D) */
+	int                 dirty_t_max;   /* last dirty row  (from glTexSubImage2D) */
 	qboolean            dirty;
+	void               *clean_data;   /* clean copy of tex->data before any dlight writes */
 } mgl_texture_t;
 
 typedef struct {
@@ -119,6 +125,23 @@ typedef struct {
 	int                  tex_source_format;
 	qboolean             tex_combine_valid;
 	int                  tex_combine;
+	/* TMU1 texture state (dual-TMU only) */
+	qboolean             tex1_filter_valid;
+	int                  tex1_min_filter;
+	int                  tex1_mag_filter;
+	qboolean             tex1_clamp_valid;
+	int                  tex1_wrap_s;
+	int                  tex1_wrap_t;
+	qboolean             tex1_mipmap_valid;
+	int                  tex1_mipmap_mode;
+	int                  tex1_mipmap_dither;
+	qboolean             tex1_source_valid;
+	FxU32                tex1_source_addr;
+	int                  tex1_source_small_lod;
+	int                  tex1_source_large_lod;
+	int                  tex1_source_aspect;
+	int                  tex1_source_format;
+	qboolean             tex1_combine_valid;
 } mgl_hw_state_t;
 
 typedef struct {
@@ -182,6 +205,20 @@ typedef struct {
 	GLfloat              proj_screen_bias;
 	GLfloat              proj_tex_s_scale;
 	GLfloat              proj_tex_t_scale;
+	/* Dual-TMU state (TMU1) */
+	int                  num_tmus;               /* 1 or 2, detected at SetMode */
+	int                  active_texture_unit;    /* 0 or 1, set by glSelectTextureSGIS */
+	GLuint               bound_texture2;         /* texture bound to TMU1 */
+	qboolean             texture_2d_enabled2;    /* GL_TEXTURE_2D enabled on TMU1 */
+	GLenum               tex_env_mode2;          /* tex env mode for TMU1 */
+	GLfloat              current_texcoord2[2];   /* current texcoord for TMU1 */
+	FxU32                tex1_min_addr;
+	FxU32                tex1_max_addr;
+	FxU32                tex1_next_addr;
+	FxU32                tex1_high_addr;
+	unsigned             tex1_generation;        /* TMU1 TRAM eviction counter */
+	GLfloat              proj_tex1_s_scale;
+	GLfloat              proj_tex1_t_scale;
 } mgl_state_t;
 
 static mgl_state_t mgl;
@@ -406,14 +443,107 @@ static void mgl_set_texture_source(FxU32 address, int lod, int aspect, int forma
 	}
 }
 
+/* Sentinel for dual-TMU combine mode (not a GrTextureCombineFnc_t value) */
+#define MGL_TMU0_COMBINE_MULTITEX (-1)
+
 static void mgl_set_texture_combine(int combine)
 {
+	/* Force re-issue if previously set in multitex mode */
+	if (mgl.hw.tex_combine == MGL_TMU0_COMBINE_MULTITEX)
+		mgl.hw.tex_combine_valid = false;
 	if (!mgl.hw.tex_combine_valid || mgl.hw.tex_combine != combine)
 	{
 		grTexCombineFunction(GR_TMU0, combine);
 		mgl.hw.tex_combine = combine;
 		mgl.hw.tex_combine_valid = true;
 	}
+}
+
+/* TMU0 combine for dual-TMU: result = TMU0_tex * TMU1_output */
+static void mgl_set_texture_combine_multitex(void)
+{
+	if (mgl.hw.tex_combine_valid && mgl.hw.tex_combine == MGL_TMU0_COMBINE_MULTITEX)
+		return;
+	grTexCombine(GR_TMU0,
+		GR_COMBINE_FUNCTION_SCALE_OTHER, GR_COMBINE_FACTOR_LOCAL,
+		GR_COMBINE_FUNCTION_SCALE_OTHER, GR_COMBINE_FACTOR_LOCAL,
+		FXFALSE, FXFALSE);
+	mgl.hw.tex_combine = MGL_TMU0_COMBINE_MULTITEX;
+	mgl.hw.tex_combine_valid = true;
+}
+
+static void mgl_set_texture_filter_tmu1(int min_filter, int mag_filter)
+{
+	if (!mgl.hw.tex1_filter_valid ||
+		mgl.hw.tex1_min_filter != min_filter ||
+		mgl.hw.tex1_mag_filter != mag_filter)
+	{
+		grTexFilterMode(GR_TMU1, min_filter, mag_filter);
+		mgl.hw.tex1_min_filter = min_filter;
+		mgl.hw.tex1_mag_filter = mag_filter;
+		mgl.hw.tex1_filter_valid = true;
+	}
+}
+
+static void mgl_set_texture_clamp_tmu1(int wrap_s, int wrap_t)
+{
+	if (!mgl.hw.tex1_clamp_valid ||
+		mgl.hw.tex1_wrap_s != wrap_s ||
+		mgl.hw.tex1_wrap_t != wrap_t)
+	{
+		grTexClampMode(GR_TMU1, wrap_s, wrap_t);
+		mgl.hw.tex1_wrap_s = wrap_s;
+		mgl.hw.tex1_wrap_t = wrap_t;
+		mgl.hw.tex1_clamp_valid = true;
+	}
+}
+
+static void mgl_set_texture_mipmap_tmu1(int mode, int dither)
+{
+	if (!mgl.hw.tex1_mipmap_valid ||
+		mgl.hw.tex1_mipmap_mode != mode ||
+		mgl.hw.tex1_mipmap_dither != dither)
+	{
+		grTexMipMapMode(GR_TMU1, mode, dither);
+		mgl.hw.tex1_mipmap_mode = mode;
+		mgl.hw.tex1_mipmap_dither = dither;
+		mgl.hw.tex1_mipmap_valid = true;
+	}
+}
+
+static void mgl_set_texture_source_tmu1(FxU32 address, int lod, int aspect, int format)
+{
+	if (!mgl.hw.tex1_source_valid ||
+		mgl.hw.tex1_source_addr != address ||
+		mgl.hw.tex1_source_small_lod != lod ||
+		mgl.hw.tex1_source_large_lod != lod ||
+		mgl.hw.tex1_source_aspect != aspect ||
+		mgl.hw.tex1_source_format != format)
+	{
+		GrTexInfo info;
+
+		info.smallLod = lod;
+		info.largeLod = lod;
+		info.aspectRatio = aspect;
+		info.format = format;
+		info.data = NULL;
+
+		grTexSource(GR_TMU1, address, GR_MIPMAPLEVELMASK_BOTH, &info);
+		mgl.hw.tex1_source_addr = address;
+		mgl.hw.tex1_source_small_lod = lod;
+		mgl.hw.tex1_source_large_lod = lod;
+		mgl.hw.tex1_source_aspect = aspect;
+		mgl.hw.tex1_source_format = format;
+		mgl.hw.tex1_source_valid = true;
+	}
+}
+
+static void mgl_set_texture_combine_tmu1(void)
+{
+	if (mgl.hw.tex1_combine_valid)
+		return;
+	grTexCombineFunction(GR_TMU1, GR_TEXTURECOMBINE_DECAL);
+	mgl.hw.tex1_combine_valid = true;
 }
 
 static GLfloat *mgl_current_matrix(void)
@@ -750,6 +880,22 @@ static void mgl_reset_texture_cache(void)
 		mgl_reserve_dynamic_lightmap(mgl.dynamic_lightmap_size);
 }
 
+static void mgl_reset_texture_cache_tmu1(void)
+{
+	unsigned i;
+
+	mgl.tex1_generation++;
+	if (mgl.tex1_generation == 0)
+	{
+		mgl.tex1_generation = 1;
+		for (i = 0; i < MGL_MAX_TEXTURES; ++i)
+			mgl_textures[i].resident_generation_tmu1 = 0;
+	}
+
+	mgl.tex1_next_addr = mgl.tex1_min_addr;
+	mgl.tex1_high_addr = mgl.tex1_max_addr;
+}
+
 static size_t mgl_texture_mem_required(const mgl_texture_t *tex)
 {
 	return (size_t)grTexCalcMemRequired(tex->lod, tex->lod, tex->aspect, tex->format);
@@ -934,6 +1080,163 @@ static qboolean mgl_reserve_dynamic_lightmap(size_t required)
 	return true;
 }
 
+static qboolean mgl_allocate_tmu1_address(size_t required, FxU32 *address)
+{
+	FxU32 candidate;
+	unsigned i;
+
+	if (!address || required == 0)
+		return false;
+
+	candidate = mgl.tex1_next_addr;
+
+	/* Wrap around to start of TRAM when we reach the end. */
+	if ((candidate + (FxU32)required) > mgl.tex1_high_addr)
+		candidate = mgl.tex1_min_addr;
+
+	/* If a single texture is larger than all of TRAM1, give up. */
+	if ((candidate + (FxU32)required) > mgl.tex1_high_addr)
+		return false;
+
+	/* Evict any textures currently occupying [candidate, candidate+required).
+	 * This is a circular-buffer eviction: oldest slot gives way to newest. */
+	for (i = 0; i < MGL_MAX_TEXTURES; ++i)
+	{
+		if (mgl_textures[i].resident_generation_tmu1 != mgl.tex1_generation)
+			continue;
+		{
+			FxU32 tex_start = mgl_textures[i].resident_addr_tmu1;
+			FxU32 tex_end   = tex_start + (FxU32)mgl_texture_mem_required(&mgl_textures[i]);
+			if (tex_start < (candidate + (FxU32)required) && tex_end > candidate)
+				mgl_textures[i].resident_generation_tmu1 = 0;  /* mark stale */
+		}
+	}
+
+	*address = candidate;
+	mgl.tex1_next_addr = candidate + (FxU32)required;
+	return true;
+}
+
+static qboolean mgl_ensure_texture_resident_tmu1(mgl_texture_t *tex)
+{
+	GrTexInfo info;
+	size_t required;
+	FxU32 tex_addr;
+
+	if (!tex || !tex->defined || !tex->data)
+		return false;
+
+	required = mgl_texture_mem_required(tex);
+	if (required == 0)
+		return false;
+
+	if (tex->resident_generation_tmu1 == mgl.tex1_generation)
+	{
+		if (!tex->dirty)
+			return true;  /* fully cached */
+
+		/* Dirty but still allocated at a valid address.
+		 * GL_RenderLightmappedPoly calls glTexSubImage2D once per dynamic
+		 * surface (e.g. animated lightstyles, dlights), then renders it
+		 * immediately.  Each call updates only a small region (smax×tmax,
+		 * typically 8–32 rows) of the 128×128 atlas.  Use a partial
+		 * download — only the rows that actually changed — instead of
+		 * re-DMA'ing the entire 32 KB atlas every time. */
+		tex_addr = tex->resident_addr_tmu1;
+		{
+			/* grTexDownloadMipMapLevelPartial expects 'data' to point at the
+			 * FIRST row being downloaded (row dirty_t_min), not at row 0. */
+			size_t bpr = (size_t)tex->width * mgl_texture_bytes_per_texel(tex->format);
+			const void *partial_data = (const GLubyte *)tex->data + (size_t)tex->dirty_t_min * bpr;
+			grTexDownloadMipMapLevelPartial(GR_TMU1,
+				tex_addr,
+				tex->lod,
+				tex->lod,
+				tex->aspect,
+				tex->format,
+				GR_MIPMAPLEVELMASK_BOTH,
+				partial_data,
+				tex->dirty_t_min,
+				tex->dirty_t_max);
+		}
+
+		/* Restore the dlight-written rows back to clean static data so
+		 * that a future full re-upload (after eviction) uses clean data. */
+		if (tex->clean_data)
+		{
+			size_t bpr = (size_t)tex->width * mgl_texture_bytes_per_texel(tex->format);
+			memcpy((GLubyte *)tex->data + (size_t)tex->dirty_t_min * bpr,
+			       (GLubyte *)tex->clean_data + (size_t)tex->dirty_t_min * bpr,
+			       (size_t)(tex->dirty_t_max - tex->dirty_t_min + 1) * bpr);
+		}
+
+		tex->dirty = false;
+		tex->dirty_t_min = 0;
+		tex->dirty_t_max = -1;
+		/* No grTexSource needed: address unchanged, hw still points to it. */
+		return true;
+	}
+
+	/* Evicted (generation stale): allocate a fresh address and upload.
+	 * Never auto-reset the TRAM cache here — that would evict ALL resident
+	 * lightmaps and cause a cascade (re-upload → fill → reset → re-upload…).
+	 * If TRAM is full, render this surface without the lightmap instead. */
+	if (!mgl_allocate_tmu1_address(required, &tex_addr))
+		return false;
+
+	/* Restore tex->data to clean static lightmap before uploading, so
+	 * TRAM sees only the original baked lightmap, not stale dlight data. */
+	if (tex->clean_data)
+		memcpy(tex->data, tex->clean_data, tex->data_size);
+
+	grTexDownloadMipMapLevel(GR_TMU1,
+		tex_addr,
+		tex->lod,
+		tex->lod,
+		tex->aspect,
+		tex->format,
+		GR_MIPMAPLEVELMASK_BOTH,
+		tex->data);
+
+	info.smallLod = tex->lod;
+	info.largeLod = tex->lod;
+	info.aspectRatio = tex->aspect;
+	info.format = tex->format;
+	info.data = NULL;
+
+	grTexSource(GR_TMU1, tex_addr, GR_MIPMAPLEVELMASK_BOTH, &info);
+
+	tex->resident_addr_tmu1 = tex_addr;
+	tex->resident_generation_tmu1 = mgl.tex1_generation;
+	tex->dirty = false;
+
+	return true;
+}
+
+static mgl_texture_t *mgl_prepare_texture_tmu1(void)
+{
+	mgl_texture_t *tex;
+
+	if (!mgl.texture_2d_enabled2 || mgl.num_tmus < 2)
+		return NULL;
+
+	tex = mgl_get_texture(mgl.bound_texture2);
+	if (!tex || !tex->defined || !mgl_ensure_texture_resident_tmu1(tex))
+		return NULL;
+
+	mgl_set_texture_filter_tmu1(
+		mgl_filter_mode(tex->min_filter),
+		mgl_filter_mode(tex->mag_filter));
+	mgl_set_texture_clamp_tmu1(
+		mgl_clamp_mode(tex->wrap_s),
+		mgl_clamp_mode(tex->wrap_t));
+	mgl_set_texture_mipmap_tmu1(GR_MIPMAP_DISABLE, FXFALSE);
+	mgl_set_texture_source_tmu1(tex->resident_addr_tmu1, tex->lod, tex->aspect, tex->format);
+	mgl_set_texture_combine_tmu1();
+
+	return tex;
+}
+
 static GrTextureFormat_t mgl_choose_texture_format(GLint internalformat)
 {
 	switch (internalformat)
@@ -1082,9 +1385,15 @@ static qboolean mgl_texture_define_image(mgl_texture_t *tex, GLint internalforma
 
 		if (tex->data)
 			free(tex->data);
-
 		tex->data = new_data;
 		tex->data_size = data_size;
+
+		/* Texture dimensions changed — old clean copy is invalid. */
+		if (tex->clean_data)
+		{
+			free(tex->clean_data);
+			tex->clean_data = NULL;
+		}
 	}
 
 	memset(tex->data, 0, data_size);
@@ -1106,7 +1415,25 @@ static qboolean mgl_texture_define_image(mgl_texture_t *tex, GLint internalforma
 	tex->format = format;
 	tex->resident_generation = 0;
 	tex->resident_addr = 0;
+	tex->dirty_t_min = 0;
+	tex->dirty_t_max = height - 1;
 	tex->dirty = true;
+
+	/* Dual-TMU: snapshot the baked static data into clean_data at upload
+	 * time so the partial-TRAM-upload path can restore tex->data without
+	 * a per-frame full-atlas scan.  Always refresh (don't guard with
+	 * clean_data != NULL) so that a map reload picks up the new data. */
+	if (mgl_texture_is_lightmap(tex) && mgl.num_tmus >= 2)
+	{
+		if (tex->clean_data)
+		{
+			free(tex->clean_data);
+			tex->clean_data = NULL;
+		}
+		tex->clean_data = malloc(data_size);
+		if (tex->clean_data)
+			memcpy(tex->clean_data, tex->data, data_size);
+	}
 
 	if (mgl_texture_is_dynamic_lightmap(tex))
 	{
@@ -1156,9 +1483,15 @@ static qboolean mgl_texture_define_paletted_image(mgl_texture_t *tex, GLint inte
 
 		if (tex->data)
 			free(tex->data);
-
 		tex->data = new_data;
 		tex->data_size = data_size;
+
+		/* Texture dimensions changed — old clean copy is invalid. */
+		if (tex->clean_data)
+		{
+			free(tex->clean_data);
+			tex->clean_data = NULL;
+		}
 	}
 
 	memset(tex->data, 0, data_size);
@@ -1220,8 +1553,21 @@ static qboolean mgl_texture_sub_image(mgl_texture_t *tex,
 		mgl_convert_rgba_row(dst, tex->width, xoffset, src, width, tex->format);
 	}
 
+	/* Accumulate dirty row range so TMU1 can do a partial re-download
+	 * instead of re-uploading the whole 128x128 atlas every time. */
+	if (!tex->dirty)
+	{
+		tex->dirty_t_min = yoffset;
+		tex->dirty_t_max = yoffset + height - 1;
+	}
+	else
+	{
+		if (yoffset              < tex->dirty_t_min) tex->dirty_t_min = yoffset;
+		if (yoffset + height - 1 > tex->dirty_t_max) tex->dirty_t_max = yoffset + height - 1;
+	}
 	tex->dirty = true;
 	tex->resident_generation = 0;
+
 	return true;
 }
 
@@ -1681,6 +2027,8 @@ static void mgl_lerp_vertex(mgl_vertex_t *out, const mgl_vertex_t *a, const mgl_
 
 	out->tex[0] = a->tex[0] + ((b->tex[0] - a->tex[0]) * t);
 	out->tex[1] = a->tex[1] + ((b->tex[1] - a->tex[1]) * t);
+	out->tex2[0] = a->tex2[0] + ((b->tex2[0] - a->tex2[0]) * t);
+	out->tex2[1] = a->tex2[1] + ((b->tex2[1] - a->tex2[1]) * t);
 }
 
 static qboolean mgl_project_vertex(const mgl_vertex_t *src, GrVertex *dst, const mgl_texture_t *tex)
@@ -1715,6 +2063,13 @@ static qboolean mgl_project_vertex(const mgl_vertex_t *src, GrVertex *dst, const
 	dst->tmuvtx[0].oow = inv_w;
 	dst->tmuvtx[0].sow = src->tex[0] * mgl.proj_tex_s_scale * inv_w;
 	dst->tmuvtx[0].tow = src->tex[1] * mgl.proj_tex_t_scale * inv_w;
+
+	if (mgl.num_tmus >= 2)
+	{
+		dst->tmuvtx[1].oow = inv_w;
+		dst->tmuvtx[1].sow = src->tex2[0] * mgl.proj_tex1_s_scale * inv_w;
+		dst->tmuvtx[1].tow = src->tex2[1] * mgl.proj_tex1_t_scale * inv_w;
+	}
 
 	return true;
 }
@@ -2373,7 +2728,9 @@ static void mgl_emit_point(const mgl_vertex_t *a)
 static void mgl_flush_primitive(void)
 {
 	mgl_texture_t *tex = NULL;
+	mgl_texture_t *tex1 = NULL;
 	qboolean textured;
+	qboolean dual_textured;
 	int i;
 	int primitive_count;
 
@@ -2383,7 +2740,18 @@ static void mgl_flush_primitive(void)
 	primitive_count = mgl.primitive_count;
 	tex = mgl_prepare_texture();
 	textured = (tex != NULL);
+	if (mgl.num_tmus >= 2)
+		tex1 = mgl_prepare_texture_tmu1();
+	dual_textured = (textured && (tex1 != NULL));
 	mgl_apply_state(textured);
+
+	if (dual_textured)
+	{
+		/* Override TMU0 combine: output = TMU0_tex * TMU1_output (base * lightmap) */
+		mgl_set_texture_combine_multitex();
+		/* Enable per-vertex ST differencing for both TMUs */
+		mgl_set_stw_hint(GR_STWHINT_ST_DIFF_TMU0 | GR_STWHINT_ST_DIFF_TMU1);
+	}
 
 	/* Cache per-flush projection constants used by mgl_project_vertex() */
 	mgl.proj_view_top = (GLfloat)(mgl.video_height - (mgl.viewport[1] + mgl.viewport[3]));
@@ -2394,6 +2762,13 @@ static void mgl_flush_primitive(void)
 	{
 		mgl.proj_tex_s_scale = 1.0f;
 		mgl.proj_tex_t_scale = 1.0f;
+	}
+	if (tex1)
+		mgl_texture_coord_scales(tex1->aspect, &mgl.proj_tex1_s_scale, &mgl.proj_tex1_t_scale);
+	else
+	{
+		mgl.proj_tex1_s_scale = 0.0f;
+		mgl.proj_tex1_t_scale = 0.0f;
 	}
 
 	switch (mgl.primitive_mode)
@@ -2479,6 +2854,7 @@ static void mgl_submit_vertex(GLfloat x, GLfloat y, GLfloat z, GLfloat w)
 	mgl_vec4_mul(vertex->clip, mgl.projection, eye);
 	memcpy(vertex->color, mgl.current_color, sizeof(vertex->color));
 	memcpy(vertex->tex, mgl.current_texcoord, sizeof(vertex->tex));
+	memcpy(vertex->tex2, mgl.current_texcoord2, sizeof(vertex->tex2));
 }
 
 static void mgl_reset_texture_object(mgl_texture_t *tex)
@@ -2490,6 +2866,12 @@ static void mgl_reset_texture_object(mgl_texture_t *tex)
 	{
 		free(tex->data);
 		tex->data = NULL;
+	}
+
+	if (tex->clean_data)
+	{
+		free(tex->clean_data);
+		tex->clean_data = NULL;
 	}
 
 	memset(tex, 0, sizeof(*tex));
@@ -2505,6 +2887,9 @@ static void mgl_reset_state(void)
 	int video_height = mgl.video_height;
 	FxU32 tex_min_addr = mgl.tex_min_addr;
 	FxU32 tex_max_addr = mgl.tex_max_addr;
+	int num_tmus = mgl.num_tmus;
+	FxU32 tex1_min_addr = mgl.tex1_min_addr;
+	FxU32 tex1_max_addr = mgl.tex1_max_addr;
 	unsigned i;
 
 	memset(&mgl, 0, sizeof(mgl));
@@ -2514,6 +2899,12 @@ static void mgl_reset_state(void)
 	mgl.video_height = video_height;
 	mgl.tex_min_addr = tex_min_addr;
 	mgl.tex_max_addr = tex_max_addr;
+	mgl.num_tmus = num_tmus;
+	mgl.tex1_min_addr = tex1_min_addr;
+	mgl.tex1_max_addr = tex1_max_addr;
+	mgl.tex1_generation = 1;
+	mgl.tex1_next_addr = tex1_min_addr;
+	mgl.tex1_high_addr = tex1_max_addr;
 	mgl.draw_buffer = GL_BACK;
 	mgl.viewport[0] = 0;
 	mgl.viewport[1] = 0;
@@ -2535,6 +2926,7 @@ static void mgl_reset_state(void)
 	mgl.shade_model = GL_SMOOTH;
 	mgl.polygon_mode = GL_FILL;
 	mgl.tex_env_mode = GL_REPLACE;
+	mgl.tex_env_mode2 = GL_REPLACE;
 	mgl.point_size = 1.0f;
 	mgl.clear_color[0] = 0.0f;
 	mgl.clear_color[1] = 0.0f;
@@ -2554,7 +2946,10 @@ static void mgl_reset_state(void)
 	mgl_mat_identity(mgl.projection);
 
 	for (i = 0; i < MGL_MAX_TEXTURES; ++i)
+	{
 		mgl_textures[i].resident_generation = 0;
+		mgl_textures[i].resident_generation_tmu1 = 0;
+	}
 
 	grRenderBuffer(GR_BUFFER_BACKBUFFER);
 	grSstOrigin(GR_ORIGIN_UPPER_LEFT);
@@ -2605,6 +3000,27 @@ qboolean MiniGL_SetMode(GrScreenResolution_t resolution, int width, int height)
 	mgl.video_height = height;
 	mgl.tex_min_addr = grTexMinAddress(GR_TMU0);
 	mgl.tex_max_addr = grTexMaxAddress(GR_TMU0);
+
+	/* Detect number of TMUs via hardware query */
+	{
+		GrHwConfiguration hwConfig;
+		mgl.num_tmus = 1;
+		mgl.tex1_min_addr = 0;
+		mgl.tex1_max_addr = 0;
+		if (grSstQueryHardware(&hwConfig) && hwConfig.num_sst > 0)
+		{
+			int ntmu = hwConfig.SSTs[0].sstBoard.VoodooConfig.nTexelfx;
+			if (ntmu >= 2)
+			{
+				mgl.num_tmus = 2;
+				mgl.tex1_min_addr = grTexMinAddress(GR_TMU1);
+				mgl.tex1_max_addr = grTexMaxAddress(GR_TMU1);
+				ri.Con_Printf(PRINT_ALL, "miniGL: dual-TMU Voodoo detected, TMU1 TRAM 0x%x-0x%x\n",
+					(unsigned)mgl.tex1_min_addr, (unsigned)mgl.tex1_max_addr);
+			}
+		}
+	}
+
 	guTexMemReset();
 	mgl_reset_state();
 	mgl.texture_generation = 1;
@@ -2748,7 +3164,10 @@ void APIENTRY glBindTexture(GLenum target, GLuint texture)
 		tex->wrap_t = GL_REPEAT;
 	}
 
-	mgl.bound_texture = texture;
+	if (mgl.active_texture_unit == 1)
+		mgl.bound_texture2 = texture;
+	else
+		mgl.bound_texture = texture;
 }
 
 void APIENTRY glBlendFunc(GLenum sfactor, GLenum dfactor)
@@ -2879,6 +3298,8 @@ void APIENTRY glDeleteTextures(GLsizei n, const GLuint *textures)
 		{
 			if (mgl.bound_texture == textures[i])
 				mgl.bound_texture = 0;
+			if (mgl.bound_texture2 == textures[i])
+				mgl.bound_texture2 = 0;
 			mgl_reset_texture_object(&mgl_textures[textures[i]]);
 		}
 	}
@@ -2904,7 +3325,12 @@ void APIENTRY glDisable(GLenum cap)
 {
 	switch (cap)
 	{
-	case GL_TEXTURE_2D:     mgl.texture_2d_enabled = false; break;
+	case GL_TEXTURE_2D:
+		if (mgl.active_texture_unit == 1)
+			mgl.texture_2d_enabled2 = false;
+		else
+			mgl.texture_2d_enabled = false;
+		break;
 	case GL_ALPHA_TEST:     mgl.alpha_test_enabled = false; break;
 	case GL_DEPTH_TEST:     mgl.depth_test_enabled = false; break;
 	case GL_CULL_FACE:      mgl.cull_enabled = false; break;
@@ -2945,7 +3371,12 @@ void APIENTRY glEnable(GLenum cap)
 {
 	switch (cap)
 	{
-	case GL_TEXTURE_2D:     mgl.texture_2d_enabled = true; break;
+	case GL_TEXTURE_2D:
+		if (mgl.active_texture_unit == 1)
+			mgl.texture_2d_enabled2 = true;
+		else
+			mgl.texture_2d_enabled = true;
+		break;
 	case GL_ALPHA_TEST:     mgl.alpha_test_enabled = true; break;
 	case GL_DEPTH_TEST:     mgl.depth_test_enabled = true; break;
 	case GL_CULL_FACE:      mgl.cull_enabled = true; break;
@@ -3016,17 +3447,19 @@ const GLubyte * APIENTRY glGetString(GLenum name)
 	static const GLubyte vendor[] = "3Dfx Interactive";
 	static const GLubyte renderer[] = "Voodoo Graphics SST-1 miniGL";
 	static const GLubyte version[] = "1.1";
-	static const GLubyte extensions[] = "GL_EXT_paletted_texture GL_EXT_shared_texture_palette";
+	static const GLubyte extensions_1tmu[] = "GL_EXT_paletted_texture GL_EXT_shared_texture_palette";
+	static const GLubyte extensions_2tmu[] = "GL_EXT_paletted_texture GL_EXT_shared_texture_palette GL_SGIS_multitexture";
 
 	switch (name)
 	{
 	case GL_VENDOR:     return vendor;
 	case GL_RENDERER:   return renderer;
 	case GL_VERSION:    return version;
-	case GL_EXTENSIONS: return extensions;
+	case GL_EXTENSIONS:
+		return (mgl.num_tmus >= 2) ? extensions_2tmu : extensions_1tmu;
 	default:
 		mgl_set_error(GL_INVALID_ENUM);
-		return extensions;
+		return extensions_1tmu;
 	}
 }
 
@@ -3187,6 +3620,29 @@ void APIENTRY glTexCoord2f(GLfloat s, GLfloat t)
 	mgl.current_texcoord[1] = t;
 }
 
+/* GL_SGIS_multitexture extension functions */
+void APIENTRY glSelectTextureSGIS(GLenum target)
+{
+	if (target == GL_TEXTURE1_SGIS)
+		mgl.active_texture_unit = 1;
+	else
+		mgl.active_texture_unit = 0;
+}
+
+void APIENTRY glMTexCoord2fSGIS(GLenum target, GLfloat s, GLfloat t)
+{
+	if (target == GL_TEXTURE1_SGIS)
+	{
+		mgl.current_texcoord2[0] = s;
+		mgl.current_texcoord2[1] = t;
+	}
+	else
+	{
+		mgl.current_texcoord[0] = s;
+		mgl.current_texcoord[1] = t;
+	}
+}
+
 void APIENTRY glTexEnvf(GLenum target, GLenum pname, GLfloat param)
 {
 	if ((target != GL_TEXTURE_ENV) || (pname != GL_TEXTURE_ENV_MODE))
@@ -3195,7 +3651,10 @@ void APIENTRY glTexEnvf(GLenum target, GLenum pname, GLfloat param)
 		return;
 	}
 
-	mgl.tex_env_mode = (GLenum)param;
+	if (mgl.active_texture_unit == 1)
+		mgl.tex_env_mode2 = (GLenum)param;
+	else
+		mgl.tex_env_mode = (GLenum)param;
 }
 
 void APIENTRY glTexImage2D(GLenum target, GLint level, GLint internalformat,
@@ -3213,7 +3672,7 @@ void APIENTRY glTexImage2D(GLenum target, GLint level, GLint internalformat,
 	if (level != 0)
 		return;
 
-	tex = mgl_get_texture(mgl.bound_texture);
+	tex = mgl_get_texture(mgl.active_texture_unit == 1 ? mgl.bound_texture2 : mgl.bound_texture);
 	if (!tex)
 		return;
 
@@ -3235,7 +3694,7 @@ void APIENTRY glTexImage2D(GLenum target, GLint level, GLint internalformat,
 
 void APIENTRY glTexParameterf(GLenum target, GLenum pname, GLfloat param)
 {
-	mgl_texture_t *tex = mgl_get_texture(mgl.bound_texture);
+	mgl_texture_t *tex = mgl_get_texture(mgl.active_texture_unit == 1 ? mgl.bound_texture2 : mgl.bound_texture);
 
 	if (!tex || target != GL_TEXTURE_2D)
 	{
@@ -3274,7 +3733,7 @@ void APIENTRY glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint y
 		return;
 	}
 
-	tex = mgl_get_texture(mgl.bound_texture);
+	tex = mgl_get_texture(mgl.active_texture_unit == 1 ? mgl.bound_texture2 : mgl.bound_texture);
 	if (!tex)
 		return;
 

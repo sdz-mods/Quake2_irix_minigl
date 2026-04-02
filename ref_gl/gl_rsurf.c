@@ -62,6 +62,7 @@ static void		LM_InitBlock( void );
 static void		LM_UploadBlock( qboolean dynamic );
 static qboolean	LM_AllocBlock (int w, int h, int *x, int *y);
 void			R_RecursiveWorldNode (mnode_t *node);
+static void		GL_RenderLightmapChains( void );
 
 extern void R_SetCacheState( msurface_t *surf );
 extern void R_BuildLightMap (msurface_t *surf, byte *dest, int stride);
@@ -792,6 +793,14 @@ static void ClearTextureChains( void )
 }
 
 
+static qboolean gl_lm_update_pass = false;
+
+/* BSP front-to-back ordered render chain built during the update pass.
+ * Surfaces are appended (FIFO) so spatial locality of the BSP traversal is
+ * preserved, keeping TMU0 world textures resident across adjacent surfaces. */
+static msurface_t *gl_lm_render_head;
+static msurface_t *gl_lm_render_tail;
+
 static void GL_RenderLightmappedPoly( msurface_t *surf )
 {
 	int		i, nv = surf->polys->numverts;
@@ -808,8 +817,9 @@ static void GL_RenderLightmappedPoly( msurface_t *surf )
 			goto dynamic;
 	}
 
-	// dynamic this frame or dynamic previously
-	if ( ( surf->dlightframe == r_framecount ) )
+	/* dynamic this frame, OR was dynamic last frame (dlight just expired —
+	 * need one more update pass to restore the static lightmap in TRAM). */
+	if ( ( surf->dlightframe == r_framecount ) || surf->cached_dlight )
 	{
 dynamic:
 		if ( gl_dynamic->value )
@@ -821,147 +831,124 @@ dynamic:
 		}
 	}
 
-	if ( is_dynamic )
+	if ( gl_lm_update_pass )
 	{
-		unsigned	temp[128*128];
-		int			smax, tmax;
-
-		if ( ( surf->styles[map] >= 32 || surf->styles[map] == 0 ) && ( surf->dlightframe != r_framecount ) )
-		{
-			smax = (surf->extents[0]>>4)+1;
-			tmax = (surf->extents[1]>>4)+1;
-
-			R_BuildLightMap( surf, (void *)temp, smax*4 );
-			R_SetCacheState( surf );
-
-			GL_MBind( GL_TEXTURE1_SGIS, gl_state.lightmap_textures + surf->lightmaptexturenum );
-
-			lmtex = surf->lightmaptexturenum;
-
-			qglTexSubImage2D( GL_TEXTURE_2D, 0,
-							  surf->light_s, surf->light_t, 
-							  smax, tmax, 
-							  GL_LIGHTMAP_FORMAT, 
-							  GL_UNSIGNED_BYTE, temp );
-
-		}
+		/* Update pass: append surface to the BSP-order render chain and
+		 * upload dynamic lightmap data.  Dirty ranges accumulate across all
+		 * dynamic surfaces in each atlas so the render pass triggers only
+		 * one partial TRAM download per dirty atlas.  FIFO order preserves
+		 * spatial locality from the BSP traversal, keeping TMU0 textures
+		 * resident across neighbouring surfaces. */
+		surf->lightmapchain = NULL;
+		if ( !gl_lm_render_head )
+			gl_lm_render_head = surf;
 		else
+			gl_lm_render_tail->lightmapchain = surf;
+		gl_lm_render_tail = surf;
+
+		if ( is_dynamic )
 		{
+			unsigned	temp[128*128];
+			int			smax, tmax;
+
 			smax = (surf->extents[0]>>4)+1;
 			tmax = (surf->extents[1]>>4)+1;
 
 			R_BuildLightMap( surf, (void *)temp, smax*4 );
 
-			GL_MBind( GL_TEXTURE1_SGIS, gl_state.lightmap_textures + 0 );
+			/* Always update cache state so cached_dlight tracks whether a
+			 * dlight was present this frame.  The next frame after the dlight
+			 * expires, cached_dlight==true keeps the surface dynamic for one
+			 * more update pass that re-uploads the static lightmap into TRAM. */
+			if ( surf->styles[map] >= 32 || surf->styles[map] == 0 )
+				R_SetCacheState( surf );
 
-			lmtex = 0;
+			GL_MBind( GL_TEXTURE1_SGIS, gl_state.lightmap_textures + lmtex );
 
 			qglTexSubImage2D( GL_TEXTURE_2D, 0,
-							  surf->light_s, surf->light_t, 
-							  smax, tmax, 
-							  GL_LIGHTMAP_FORMAT, 
+							  surf->light_s, surf->light_t,
+							  smax, tmax,
+							  GL_LIGHTMAP_FORMAT,
 							  GL_UNSIGNED_BYTE, temp );
-
 		}
+		return;
+	}
 
-		c_brush_polys++;
+	/* Render pass: draw surface with both textures.  For dirty atlases the
+	 * first glEnd() on each atlas flushes the accumulated partial TRAM
+	 * download; subsequent surfaces in the same atlas see dirty=false and
+	 * skip the download entirely. */
+	c_brush_polys++;
 
-		GL_MBind( GL_TEXTURE0_SGIS, image->texnum );
-		GL_MBind( GL_TEXTURE1_SGIS, gl_state.lightmap_textures + lmtex );
+	GL_MBind( GL_TEXTURE0_SGIS, image->texnum );
+	GL_MBind( GL_TEXTURE1_SGIS, gl_state.lightmap_textures + lmtex );
 
 //==========
 //PGM
-		if (surf->texinfo->flags & SURF_FLOWING)
-		{
-			float scroll;
-		
-			scroll = -64 * ( (r_newrefdef.time / 40.0) - (int)(r_newrefdef.time / 40.0) );
-			if(scroll == 0.0)
-				scroll = -64.0;
+	if (surf->texinfo->flags & SURF_FLOWING)
+	{
+		float scroll;
 
-			for ( p = surf->polys; p; p = p->chain )
-			{
-				v = p->verts[0];
-				qglBegin (GL_POLYGON);
-				for (i=0 ; i< nv; i++, v+= VERTEXSIZE)
-				{
-					qglMTexCoord2fSGIS( GL_TEXTURE0_SGIS, (v[3]+scroll), v[4]);
-					qglMTexCoord2fSGIS( GL_TEXTURE1_SGIS, v[5], v[6]);
-					qglVertex3fv (v);
-				}
-				qglEnd ();
-			}
-		}
-		else
+		scroll = -64 * ( (r_newrefdef.time / 40.0) - (int)(r_newrefdef.time / 40.0) );
+		if(scroll == 0.0)
+			scroll = -64.0;
+
+		for ( p = surf->polys; p; p = p->chain )
 		{
-			for ( p = surf->polys; p; p = p->chain )
+			v = p->verts[0];
+			qglBegin (GL_POLYGON);
+			for (i=0 ; i< nv; i++, v+= VERTEXSIZE)
 			{
-				v = p->verts[0];
-				qglBegin (GL_POLYGON);
-				for (i=0 ; i< nv; i++, v+= VERTEXSIZE)
-				{
-					qglMTexCoord2fSGIS( GL_TEXTURE0_SGIS, v[3], v[4]);
-					qglMTexCoord2fSGIS( GL_TEXTURE1_SGIS, v[5], v[6]);
-					qglVertex3fv (v);
-				}
-				qglEnd ();
+				qglMTexCoord2fSGIS( GL_TEXTURE0_SGIS, (v[3]+scroll), v[4]);
+				qglMTexCoord2fSGIS( GL_TEXTURE1_SGIS, v[5], v[6]);
+				qglVertex3fv (v);
 			}
+			qglEnd ();
 		}
-//PGM
-//==========
 	}
 	else
 	{
-		c_brush_polys++;
-
-		GL_MBind( GL_TEXTURE0_SGIS, image->texnum );
-		GL_MBind( GL_TEXTURE1_SGIS, gl_state.lightmap_textures + lmtex );
-
-//==========
 //PGM
-		if (surf->texinfo->flags & SURF_FLOWING)
+//==========
+		for ( p = surf->polys; p; p = p->chain )
 		{
-			float scroll;
-		
-			scroll = -64 * ( (r_newrefdef.time / 40.0) - (int)(r_newrefdef.time / 40.0) );
-			if(scroll == 0.0)
-				scroll = -64.0;
-
-			for ( p = surf->polys; p; p = p->chain )
+			v = p->verts[0];
+			qglBegin (GL_POLYGON);
+			for (i=0 ; i< nv; i++, v+= VERTEXSIZE)
 			{
-				v = p->verts[0];
-				qglBegin (GL_POLYGON);
-				for (i=0 ; i< nv; i++, v+= VERTEXSIZE)
-				{
-					qglMTexCoord2fSGIS( GL_TEXTURE0_SGIS, (v[3]+scroll), v[4]);
-					qglMTexCoord2fSGIS( GL_TEXTURE1_SGIS, v[5], v[6]);
-					qglVertex3fv (v);
-				}
-				qglEnd ();
+				qglMTexCoord2fSGIS( GL_TEXTURE0_SGIS, v[3], v[4]);
+				qglMTexCoord2fSGIS( GL_TEXTURE1_SGIS, v[5], v[6]);
+				qglVertex3fv (v);
 			}
+			qglEnd ();
 		}
-		else
-		{
-//PGM
-//==========
-			for ( p = surf->polys; p; p = p->chain )
-			{
-				v = p->verts[0];
-				qglBegin (GL_POLYGON);
-				for (i=0 ; i< nv; i++, v+= VERTEXSIZE)
-				{
-					qglMTexCoord2fSGIS( GL_TEXTURE0_SGIS, v[3], v[4]);
-					qglMTexCoord2fSGIS( GL_TEXTURE1_SGIS, v[5], v[6]);
-					qglVertex3fv (v);
-				}
-				qglEnd ();
-			}
 //==========
 //PGM
-		}
-//PGM
-//==========
 	}
+//PGM
+//==========
+}
+
+/*
+=================
+GL_RenderLightmapChains
+
+Render pass for the world: iterate per-atlas surface chains collected
+during the update pass.  No BSP traversal — one partial TRAM download
+fires per dirty atlas on the first glEnd(), subsequent surfaces skip it.
+=================
+*/
+static void GL_RenderLightmapChains( void )
+{
+	msurface_t *surf;
+
+	for ( surf = gl_lm_render_head; surf; surf = surf->lightmapchain )
+	{
+		GL_RenderLightmappedPoly( surf );
+	}
+
+	gl_lm_render_head = NULL;
+	gl_lm_render_tail = NULL;
 }
 
 /*
@@ -998,8 +985,32 @@ void R_DrawInlineBModel (void)
 	}
 
 	//
-	// draw texture
+	// draw texture — two passes when multitexture is active so dynamic
+	// lightmap uploads for all surfaces accumulate before the first glEnd()
 	//
+	if ( qglMTexCoord2fSGIS )
+	{
+		gl_lm_update_pass = true;
+		for (psurf = &currentmodel->surfaces[currentmodel->firstmodelsurface], i=0;
+		     i < currentmodel->nummodelsurfaces; i++, psurf++)
+		{
+			pplane = psurf->plane;
+			dot = DotProduct (modelorg, pplane->normal) - pplane->dist;
+			if (((psurf->flags & SURF_PLANEBACK) && (dot < -BACKFACE_EPSILON)) ||
+				(!(psurf->flags & SURF_PLANEBACK) && (dot > BACKFACE_EPSILON)))
+			{
+				if ( !( psurf->texinfo->flags & (SURF_TRANS33|SURF_TRANS66) ) &&
+				     !( psurf->flags & SURF_DRAWTURB ) )
+				{
+					GL_RenderLightmappedPoly( psurf );
+				}
+			}
+		}
+		gl_lm_update_pass = false;
+		gl_state.currenttextures[1] = -1;
+		psurf = &currentmodel->surfaces[currentmodel->firstmodelsurface];
+	}
+
 	for (i=0 ; i<currentmodel->nummodelsurfaces ; i++, psurf++)
 	{
 	// find which side of the node we are on
@@ -1290,6 +1301,8 @@ void R_RecursiveWorldNode (mnode_t *node)
 		{
 			if ( qglMTexCoord2fSGIS && !( surf->flags & SURF_DRAWTURB ) )
 			{
+				/* In update pass: collects into chain + uploads dynamic data.
+				 * In render pass (called from GL_RenderLightmapChains): draws. */
 				GL_RenderLightmappedPoly( surf );
 			}
 			else
@@ -1385,10 +1398,22 @@ void R_DrawWorld (void)
 
 		if ( gl_lightmap->value )
 			GL_TexEnv( GL_REPLACE );
-		else 
+		else
 			GL_TexEnv( GL_MODULATE );
 
+		/* Update pass: one BSP traversal to upload dynamic lightmaps and
+		 * collect all MT surfaces in BSP front-to-back order. Sky, alpha
+		 * and turb surfaces are also handled here (no second traversal). */
+		gl_lm_render_head = NULL;
+		gl_lm_render_tail = NULL;
+		gl_lm_update_pass = true;
 		R_RecursiveWorldNode (r_worldmodel->nodes);
+		gl_lm_update_pass = false;
+
+		/* Render pass: iterate per-atlas chains — no BSP traversal.
+		 * Dirty atlases flush one partial TRAM download on first use. */
+		gl_state.currenttextures[1] = -1;
+		GL_RenderLightmapChains();
 
 		GL_EnableMultitexture( false );
 	}
