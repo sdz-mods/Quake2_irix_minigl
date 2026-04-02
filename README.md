@@ -2,8 +2,6 @@
 
 Quake2 with miniGL backend port for IRIX.
 
-Current limitations: keyboard input is via stdin. Mouse not yet supported.
-
 ## Building
 
 ### Prerequisites
@@ -26,7 +24,7 @@ Build and install the IRIX glide port:
 ```csh
 #clone or copy this repo onto the target system, e.g. /usr/3dfx_irix/Quake2_irix_minigl
 cd /usr/3dfx_irix/Quake2_irix_minigl
-smake -f irix/Makefile.irixfx MESA_ROOT=/usr/sdd/3dfx_irix/MesaFX_irix GLIDE_ROOT=/usr/sdd/3dfx_irix/glide_irix
+smake -f irix/Makefile.irixfx GLIDE_ROOT=/usr/sdd/3dfx_irix/glide_irix
 
 ```
 
